@@ -31,6 +31,7 @@ pub const NONCE_LEN: usize = 24;
 pub const AAD_VAULT_KEY: &[u8] = b"softvault/v1/vault-key";
 pub const AAD_SETTINGS: &[u8] = b"softvault/v1/settings";
 pub const AAD_EXPORT: &[u8] = b"softvault/v1/export";
+pub const AAD_FOLDERS: &[u8] = b"softvault/v1/folders";
 
 pub type Key = Zeroizing<[u8; KEY_LEN]>;
 

@@ -321,20 +321,24 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Column x-offsets for the vault table: icon | name | type | updated | options
 pub struct Cols {
     pub name: f32,
+    pub folder: f32,
     pub kind: f32,
+    pub views: f32,
     pub updated: f32,
     pub options: f32,
 }
 
 pub fn cols(rect: Rect) -> Cols {
     let w = rect.width();
+    let x = rect.left();
     Cols {
-        name: rect.left() + 52.0,
-        kind: rect.left() + (w * 0.52).max(260.0),
-        updated: rect.left() + (w * 0.72).max(400.0),
+        name: x + 52.0,
+        folder: x + (w * 0.42).max(240.0),
+        kind: x + (w * 0.59).max(360.0),
+        views: x + (w * 0.73).max(450.0),
+        updated: x + (w * 0.80).max(500.0),
         options: rect.right() - 56.0,
     }
 }
@@ -342,7 +346,9 @@ pub fn cols(rect: Rect) -> Cols {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SortCol {
     Name,
+    Folder,
     Type,
+    Views,
     Updated,
 }
 
@@ -352,13 +358,15 @@ pub fn table_header(ui: &mut Ui, p: &Palette, sort: (SortCol, bool)) -> Option<S
     let c = cols(rect);
     let y = rect.center().y;
     let mut clicked = None;
-    for (col, x, w, text) in [
-        (SortCol::Name, c.name, c.kind - c.name - 10.0, "Name"),
-        (SortCol::Type, c.kind, c.updated - c.kind - 10.0, "Type"),
-        (SortCol::Updated, c.updated, c.options - c.updated - 10.0, "Updated"),
+    for (col, x, next, text) in [
+        (SortCol::Name, c.name, c.folder, "Name"),
+        (SortCol::Folder, c.folder, c.kind, "Folder"),
+        (SortCol::Type, c.kind, c.views, "Type"),
+        (SortCol::Views, c.views, c.updated, "Views"),
+        (SortCol::Updated, c.updated, c.options, "Updated"),
     ] {
-        let hit = Rect::from_min_size(egui::pos2(x - 6.0, rect.top()), Vec2::new(w.max(60.0), rect.height()));
-        let r = ui.interact(hit, ui.scope_id().with(("sort", text)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let hit = Rect::from_min_size(egui::pos2(x - 6.0, rect.top()), Vec2::new((next - x - 4.0).max(40.0), rect.height()));
+        let r = ui.interact(hit, egui::Id::unique("softvault-sort").with(text), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
         let active = sort.0 == col;
         let colr = if active || r.hovered() { p.text } else { p.weak };
         let g = ui.painter().layout_no_wrap(text.into(), FontId::new(12.5, semibold()), colr);
@@ -377,67 +385,99 @@ pub fn table_header(ui: &mut Ui, p: &Palette, sort: (SortCol, bool)) -> Option<S
     clicked
 }
 
+/// A small rounded tag pill; returns its width.
+pub fn paint_tag(painter: &egui::Painter, pos: egui::Pos2, tag: &str, p: &Palette) -> f32 {
+    let col = avatar_color(tag);
+    let g = painter.layout_no_wrap(format!("#{tag}"), FontId::proportional(11.0), if p.dark { lerp(col, Color32::WHITE, 0.45) } else { col });
+    let r = Rect::from_min_size(pos, g.size() + Vec2::new(12.0, 4.0));
+    painter.rect_filled(r, PILL, col.gamma_multiply(if p.dark { 0.28 } else { 0.12 }));
+    painter.galley(r.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
+    r.width()
+}
+
+pub struct RowData<'a> {
+    pub title: &'a str,
+    pub subtitle: &'a str,
+    pub note: bool,
+    pub note_icon: &'a str,
+    pub badge: &'a str,
+    pub favorite: bool,
+    pub folder: &'a str,
+    pub tags: &'a [String],
+    pub views: u64,
+    pub updated: &'a str,
+    pub selected: bool,
+    pub drop_target: bool,
+}
+
 /// One table row; returns the row response and the rect reserved for the options button.
-#[allow(clippy::too_many_arguments)]
-pub fn table_row(
-    ui: &mut Ui,
-    p: &Palette,
-    title: &str,
-    subtitle: &str,
-    note: bool,
-    note_icon: &str,
-    badge: &str,
-    favorite: bool,
-    updated: &str,
-    selected: bool,
-) -> (Response, Rect) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), if note { Sense::click_and_drag() } else { Sense::click() });
+/// Rows are click-and-drag: drag onto a folder to move, or out of the window to export.
+pub fn table_row(ui: &mut Ui, p: &Palette, d: &RowData) -> (Response, Rect) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click_and_drag());
     let c = cols(rect);
     let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter();
     let ht = ui.ctx().animate_bool_with_time(resp.id.with("hover"), hovered, 0.12);
-    let bg = if selected { p.accent_soft } else { lerp(p.card, p.card_hover, ht) };
-    if selected || ht > 0.0 {
+    let bg = if d.selected { p.accent_soft } else { lerp(p.card, p.card_hover, ht) };
+    if d.selected || ht > 0.0 {
         painter.rect_filled(rect, CornerRadius::same(8), bg);
+    }
+    if resp.dragged() {
+        painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.5, p.accent), StrokeKind::Inside);
     }
     painter.hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.border));
 
     // favicon-like tile
-    let ic = egui::pos2(rect.left() + 28.0, rect.center().y);
-    let col = if note { p.weak } else { avatar_color(title) };
-    let tile = Rect::from_center_size(ic, Vec2::splat(30.0));
+    let icp = egui::pos2(rect.left() + 28.0, rect.center().y);
+    let col = if d.note { p.weak } else { avatar_color(d.title) };
+    let tile = Rect::from_center_size(icp, Vec2::splat(30.0));
     painter.rect_filled(tile, CornerRadius::same(8), col.gamma_multiply(if p.dark { 0.30 } else { 0.12 }));
-    let glyph = if note {
-        note_icon.to_string()
-    } else {
-        title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())
-    };
-    painter.text(ic, Align2::CENTER_CENTER, glyph, FontId::new(if note { 15.0 } else { 13.5 }, semibold()), if p.dark { lerp(col, Color32::WHITE, 0.35) } else { col });
+    let glyph = if d.note { d.note_icon.to_string() } else { d.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into()) };
+    painter.text(icp, Align2::CENTER_CENTER, glyph, FontId::new(if d.note { 15.0 } else { 13.5 }, semibold()), if p.dark { lerp(col, Color32::WHITE, 0.35) } else { col });
 
-    let name_w = (c.kind - c.name - 16.0).max(60.0);
+    // name + favorite + subtitle + tags
+    let name_w = (c.folder - c.name - 16.0).max(60.0);
     let max_chars = (name_w / 7.2) as usize;
-    let t = if title.is_empty() { "(untitled)" } else { title };
-    let title_txt = truncate(t, max_chars.saturating_sub(if favorite { 2 } else { 0 }));
-    let tg = painter.layout_no_wrap(title_txt, FontId::new(14.0, semibold()), p.accent);
+    let t = if d.title.is_empty() { "(untitled)" } else { d.title };
+    let tg = painter.layout_no_wrap(truncate(t, max_chars.saturating_sub(if d.favorite { 2 } else { 0 })), FontId::new(14.0, semibold()), p.accent);
     let tw = tg.size().x;
     painter.galley(egui::pos2(c.name, rect.center().y - 17.0), tg, p.accent);
-    if favorite {
+    if d.favorite {
         painter.text(egui::pos2(c.name + tw + 6.0, rect.center().y - 9.5), Align2::LEFT_CENTER, ic::STAR, FontId::proportional(12.0), p.warn);
     }
-    painter.text(egui::pos2(c.name, rect.center().y + 9.0), Align2::LEFT_CENTER, truncate(subtitle, max_chars + 4), FontId::proportional(12.5), p.weak);
+    let sub_g = painter.layout_no_wrap(truncate(d.subtitle, (max_chars / 2).max(12)), FontId::proportional(12.5), p.weak);
+    let sub_w = if d.subtitle.is_empty() { 0.0 } else { sub_g.size().x + 8.0 };
+    painter.galley(egui::pos2(c.name, rect.center().y + 2.0), sub_g, p.weak);
+    let mut x = c.name + sub_w;
+    let clip = painter.with_clip_rect(Rect::from_min_max(egui::pos2(c.name, rect.top()), egui::pos2(c.folder - 10.0, rect.bottom())));
+    for tag in d.tags.iter().take(4) {
+        x += paint_tag(&clip, egui::pos2(x, rect.center().y + 2.0), tag, p) + 4.0;
+    }
+
+    // folder
+    if !d.folder.is_empty() {
+        let fmax = ((c.kind - c.folder - 30.0) / 7.0).max(4.0) as usize;
+        painter.text(egui::pos2(c.folder, rect.center().y), Align2::LEFT_CENTER, ic::FOLDER, FontId::proportional(13.0), p.weak);
+        painter.text(egui::pos2(c.folder + 18.0, rect.center().y), Align2::LEFT_CENTER, truncate(d.folder, fmax), FontId::proportional(12.5), p.text);
+    } else {
+        painter.text(egui::pos2(c.folder, rect.center().y), Align2::LEFT_CENTER, "—", FontId::proportional(12.5), p.weak.gamma_multiply(0.6));
+    }
 
     // type badge
-    let g = painter.layout_no_wrap(badge.into(), FontId::proportional(12.0), p.text);
+    let g = painter.layout_no_wrap(d.badge.into(), FontId::proportional(12.0), p.text);
     let br = Rect::from_min_size(egui::pos2(c.kind, rect.center().y - 11.0), g.size() + Vec2::new(16.0, 8.0));
     painter.rect_filled(br, CornerRadius::same(6), if p.dark { p.card_hover } else { p.bg_alt });
     painter.rect_stroke(br, CornerRadius::same(6), Stroke::new(1.0, p.border), StrokeKind::Inside);
     painter.galley(br.min + Vec2::new(8.0, 4.0), g, p.text);
 
     if !hovered {
-        // on hover the date column is replaced by quick actions
-        painter.text(egui::pos2(c.updated, rect.center().y), Align2::LEFT_CENTER, updated, FontId::proportional(12.5), p.weak);
+        // on hover the views/updated columns are replaced by quick actions
+        painter.text(egui::pos2(c.views, rect.center().y), Align2::LEFT_CENTER, format!("{}  {}", ic::EYE, d.views), FontId::proportional(12.5), p.weak);
+        painter.text(egui::pos2(c.updated, rect.center().y), Align2::LEFT_CENTER, d.updated, FontId::proportional(12.5), p.weak);
     }
-
+    if d.drop_target {
+        painter.rect_stroke(rect, CornerRadius::same(8), Stroke::new(2.0, p.accent), StrokeKind::Inside);
+    }
     let opt = Rect::from_center_size(egui::pos2(c.options + 20.0, rect.center().y), Vec2::new(32.0, 32.0));
     (resp.on_hover_cursor(egui::CursorIcon::PointingHand), opt)
 }
@@ -630,8 +670,10 @@ pub fn dashed_rounded_rect(painter: &egui::Painter, rect: Rect, radius: f32, str
 }
 
 /// Card for one encrypted file. Returns (card response, save clicked).
-pub fn file_card(ui: &mut Ui, p: &Palette, icon: &str, tone: Color32, name: &str, info: &str, size: Vec2) -> (Response, Rect) {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+#[allow(clippy::too_many_arguments)]
+pub fn file_card(ui: &mut Ui, p: &Palette, id: egui::Id, icon: &str, tone: Color32, name: &str, info: &str, folder: &str, tags: &[String], size: Vec2) -> (Response, Rect) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
     let hovered = ui.rect_contains_pointer(rect);
     let ht = ui.ctx().animate_bool_with_time(resp.id.with("hover"), hovered, 0.14);
     let painter = ui.painter();
@@ -651,6 +693,121 @@ pub fn file_card(ui: &mut Ui, p: &Palette, icon: &str, tone: Color32, name: &str
     let max_chars = ((r.width() - 32.0) / 7.4) as usize;
     painter.text(egui::pos2(r.left() + 16.0, tile.bottom() + 18.0), Align2::LEFT_CENTER, truncate(name, max_chars), FontId::new(14.0, semibold()), p.text);
     painter.text(egui::pos2(r.left() + 16.0, tile.bottom() + 38.0), Align2::LEFT_CENTER, info, FontId::proportional(12.0), p.weak);
+    // folder badge (top-right of the tile row)
+    if !folder.is_empty() {
+        let fg = painter.layout_no_wrap(format!("{}  {}", ic::FOLDER, truncate(folder, 18)), FontId::proportional(11.5), p.weak);
+        painter.galley(egui::pos2(tile.right() + 10.0, tile.center().y - fg.size().y / 2.0), fg, p.weak);
+    }
+    // tags
+    let clip = painter.with_clip_rect(Rect::from_min_max(egui::pos2(r.left() + 12.0, r.top()), egui::pos2(r.right() - 12.0, r.bottom())));
+    let mut x = r.left() + 16.0;
+    for t in tags.iter().take(5) {
+        x += paint_tag(&clip, egui::pos2(x, tile.bottom() + 52.0), t, p) + 4.0;
+    }
     let actions = Rect::from_min_max(egui::pos2(r.left() + 8.0, r.bottom() - 42.0), egui::pos2(r.right() - 8.0, r.bottom() - 6.0));
     (resp.on_hover_cursor(if hovered { egui::CursorIcon::Grab } else { egui::CursorIcon::Default }), actions)
+}
+
+/// Sidebar folder row with indentation and an expand chevron.
+/// Returns (row response, chevron clicked).
+#[allow(clippy::too_many_arguments)]
+pub fn tree_item(ui: &mut Ui, p: &Palette, id: egui::Id, name: &str, depth: usize, expanded: Option<bool>, selected: bool, count: usize, drop_hover: bool) -> (Response, bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click());
+    let ht = ui.ctx().animate_bool_with_time(id.with("hover"), resp.hovered() || drop_hover, 0.12);
+    let painter = ui.painter();
+    let mut bg = lerp(Color32::TRANSPARENT, p.nav_hover, ht);
+    if selected {
+        bg = p.nav_active;
+    }
+    painter.rect_filled(rect, R_INPUT, bg);
+    if drop_hover {
+        painter.rect_stroke(rect, R_INPUT, Stroke::new(1.5, p.nav_text), StrokeKind::Inside);
+    }
+    let col = if selected { p.nav_active_text } else { p.nav_text };
+    let x0 = rect.left() + 8.0 + depth as f32 * 14.0;
+    let mut chevron_clicked = false;
+    if let Some(open) = expanded {
+        let cr = Rect::from_center_size(egui::pos2(x0 + 6.0, rect.center().y), Vec2::splat(18.0));
+        let cresp = ui.interact(cr, id.with("chev"), Sense::click());
+        chevron_clicked = cresp.clicked();
+        let painter = ui.painter();
+        painter.text(cr.center(), Align2::CENTER_CENTER, if open { ic::CHEVRON_DOWN } else { ic::CHEVRON_RIGHT }, FontId::proportional(12.0), if selected { col } else { p.nav_weak });
+    }
+    let painter = ui.painter();
+    painter.text(egui::pos2(x0 + 20.0, rect.center().y), Align2::LEFT_CENTER, if expanded == Some(true) { ic::FOLDER_OPEN } else { ic::FOLDER }, FontId::proportional(15.0), col);
+    let max_chars = ((rect.right() - x0 - 70.0) / 7.2).max(4.0) as usize;
+    painter.text(egui::pos2(x0 + 42.0, rect.center().y), Align2::LEFT_CENTER, truncate(name, max_chars), FontId::new(13.5, if selected { semibold() } else { egui::FontFamily::Proportional }), col);
+    if count > 0 {
+        painter.text(rect.right_center() - Vec2::new(12.0, 0.0), Align2::RIGHT_CENTER, count.to_string(), FontId::proportional(11.5), if selected { col } else { p.nav_weak });
+    }
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), chevron_clicked)
+}
+
+/// Sidebar tag row (#tag with a colored dot).
+pub fn tag_nav_item(ui: &mut Ui, p: &Palette, tag: &str, selected: bool, count: usize) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
+    let ht = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let painter = ui.painter();
+    let bg = if selected { p.nav_active } else { lerp(Color32::TRANSPARENT, p.nav_hover, ht) };
+    painter.rect_filled(rect, R_INPUT, bg);
+    let col = if selected { p.nav_active_text } else { p.nav_text };
+    painter.circle_filled(egui::pos2(rect.left() + 18.0, rect.center().y), 4.5, avatar_color(tag));
+    painter.text(egui::pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, format!("#{tag}"), FontId::proportional(13.0), col);
+    painter.text(rect.right_center() - Vec2::new(12.0, 0.0), Align2::RIGHT_CENTER, count.to_string(), FontId::proportional(11.5), if selected { col } else { p.nav_weak });
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Tag editor: existing tags as removable pills + an input that adds on Enter / comma.
+/// Returns true if tags changed.
+pub fn tag_editor(ui: &mut Ui, p: &Palette, id_salt: &str, tags: &mut Vec<String>, suggestions: &[String]) -> bool {
+    let mut changed = false;
+    let input_id = egui::Id::unique(id_salt).with("input");
+    let mut input: String = ui.ctx().data_mut(|d| d.get_temp::<String>(input_id).unwrap_or_default());
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+        let mut remove = None;
+        for (i, t) in tags.iter().enumerate() {
+            let col = avatar_color(t);
+            let txt = RichText::new(format!("#{t}  {}", ic::X)).size(12.5).color(if p.dark { lerp(col, Color32::WHITE, 0.45) } else { col });
+            if ui
+                .add(egui::Button::new(txt).fill(col.gamma_multiply(if p.dark { 0.28 } else { 0.12 })).stroke(Stroke::NONE).corner_radius(PILL).min_size(Vec2::new(0.0, 26.0)))
+                .on_hover_text("Remove tag")
+                .clicked()
+            {
+                remove = Some(i);
+            }
+        }
+        if let Some(i) = remove {
+            tags.remove(i);
+            changed = true;
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut input).id(input_id.with("te")).hint_text("Add tag…").desired_width(130.0).margin(Margin::symmetric(10, 5)));
+        let commit = (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || input.contains(',');
+        if commit {
+            for t in input.split(',') {
+                let t = t.trim().trim_start_matches('#').to_lowercase().replace(char::is_whitespace, "-");
+                if !t.is_empty() && !tags.contains(&t) {
+                    tags.push(t);
+                    changed = true;
+                }
+            }
+            input.clear();
+            r.request_focus();
+        }
+        // quick-pick existing tags matching the input
+        if r.has_focus() || !input.is_empty() {
+            let q = input.trim().to_lowercase();
+            let picks: Vec<String> = suggestions.iter().filter(|s| !tags.contains(s) && (q.is_empty() || s.contains(&q))).take(6).cloned().collect();
+            for s in picks {
+                if ui.add(egui::Button::new(RichText::new(format!("+ #{s}")).size(12.0).color(p.weak)).fill(Color32::TRANSPARENT).stroke(Stroke::new(1.0, p.border)).corner_radius(PILL)).clicked() {
+                    tags.push(s);
+                    changed = true;
+                    input.clear();
+                }
+            }
+        }
+    });
+    ui.ctx().data_mut(|d| d.insert_temp(input_id, input));
+    changed
 }

@@ -61,6 +61,24 @@ struct Row {
     updated: i64,
     badge: &'static str,
     note_icon: &'static str,
+    folder: String,
+    tags: Vec<String>,
+    views: u64,
+}
+
+/// Internal drag & drop payload (rows/cards/folders dragged onto sidebar folders).
+#[derive(Clone)]
+enum DragRef {
+    Item(String),
+    File(String),
+    Folder(String),
+}
+
+struct FolderDialog {
+    /// Some(id) = renaming that folder
+    rename: Option<String>,
+    parent: Option<String>,
+    name: String,
 }
 
 #[derive(Default)]
@@ -176,6 +194,11 @@ pub struct SoftVaultApp {
     drag_out: Option<DragSource>,
     file_confirm: Option<String>,
     file_deleting: Option<(String, Instant)>,
+    folder_filter: Option<String>,
+    tag_filter: std::collections::BTreeSet<String>,
+    expanded: std::collections::HashSet<String>,
+    folder_dialog: Option<FolderDialog>,
+    confirm_folder_delete: Option<String>,
 }
 
 const DELETE_ANIM_SECS: f32 = 0.85;
@@ -251,6 +274,11 @@ impl SoftVaultApp {
             drag_out: None,
             file_confirm: None,
             file_deleting: None,
+            folder_filter: None,
+            tag_filter: Default::default(),
+            expanded: Default::default(),
+            folder_dialog: None,
+            confirm_folder_delete: None,
         }
     }
 
@@ -692,6 +720,9 @@ impl SoftVaultApp {
             });
 
         self.shortcuts(&ctx);
+        if self.folder_dialog.is_some() {
+            self.ui_folder_dialog(&ctx, p);
+        }
         if self.editor.is_some() {
             self.ui_editor_modal(&ctx, p);
         }
@@ -711,44 +742,153 @@ impl SoftVaultApp {
                 ui.label(RichText::new("Password Manager").size(11.5).color(p.nav_weak));
             });
         });
-        ui.add_space(18.0);
-        ui.spacing_mut().item_spacing.y = 3.0;
-        let n_pw = self.vault.items.iter().filter(|i| i.data.kind == Kind::Password).count();
-        let n_notes = self.vault.items.iter().filter(|i| i.data.kind == Kind::Note).count();
-        let n_fav = self.vault.items.iter().filter(|i| i.data.favorite).count();
-        w::nav_section(ui, p, "VAULT");
-        for (v, icon, text, count) in [
-            (View::All, ic::LAYERS, "All items", self.vault.items.len()),
-            (View::Passwords, ic::KEY_ROUND, "Logins", n_pw),
-            (View::Notes, ic::STICKY_NOTE, "Secure notes", n_notes),
-            (View::Favorites, ic::STAR, "Favorites", n_fav),
-            (View::Files, ic::FOLDER_LOCK, "Secure files", self.vault.files.len()),
-        ] {
-            if w::nav_item(ui, p, icon, text, self.view == v, Some(count)).clicked() {
-                self.view = v;
+        ui.add_space(14.0);
+        let footer_h = 118.0;
+        let body_h = (ui.available_height() - footer_h).max(120.0);
+        ScrollArea::vertical().id_salt("softvault-nav-scroll").max_height(body_h).auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            let n_pw = self.vault.items.iter().filter(|i| i.data.kind == Kind::Password).count();
+            let n_notes = self.vault.items.iter().filter(|i| i.data.kind == Kind::Note).count();
+            let n_fav = self.vault.items.iter().filter(|i| i.data.favorite).count();
+            w::nav_section(ui, p, "VAULT");
+            for (v, icon, text, count) in [
+                (View::All, ic::LAYERS, "All items", self.vault.items.len()),
+                (View::Passwords, ic::KEY_ROUND, "Logins", n_pw),
+                (View::Notes, ic::STICKY_NOTE, "Secure notes", n_notes),
+                (View::Favorites, ic::STAR, "Favorites", n_fav),
+                (View::Files, ic::FOLDER_LOCK, "Secure files", self.vault.files.len()),
+            ] {
+                let sel = self.view == v && self.folder_filter.is_none() && self.tag_filter.is_empty();
+                let r = w::nav_item(ui, p, icon, text, sel, Some(count));
+                // dropping on "All items" takes things out of their folder
+                if v == View::All {
+                    if r.dnd_hover_payload::<DragRef>().is_some() {
+                        ui.painter().rect_stroke(r.rect, theme::R_INPUT, Stroke::new(1.5, p.nav_text), egui::StrokeKind::Inside);
+                    }
+                    if let Some(pl) = r.dnd_release_payload::<DragRef>() {
+                        self.move_to_folder(&pl, None);
+                    }
+                }
+                if r.clicked() {
+                    self.view = v;
+                    self.folder_filter = None;
+                    self.tag_filter.clear();
+                }
             }
-        }
-        w::nav_section(ui, p, "TOOLS");
-        if w::nav_item(ui, p, ic::DICES, "Generator", self.view == View::Generator, None).clicked() {
-            self.view = View::Generator;
-        }
-        let issues = self.health().issue_count();
-        if w::nav_item(ui, p, ic::SHIELD_CHECK, "Vault health", self.view == View::Health, (issues > 0).then_some(issues)).clicked() {
-            self.view = View::Health;
-        }
-        w::nav_section(ui, p, "MANAGE");
-        if w::nav_item(ui, p, ic::ARROW_DOWN_UP, "Import & export", self.view == View::Settings && self.su.tab == 3, None).clicked() {
-            self.view = View::Settings;
-            self.su.loaded = false;
-            self.su.tab = 3;
-        }
-        if w::nav_item(ui, p, ic::SETTINGS, "Settings", self.view == View::Settings && self.su.tab != 3, None).clicked() {
-            self.view = View::Settings;
-            self.su.loaded = false;
-            if self.su.tab == 3 {
-                self.su.tab = 0;
+
+            // ── folder tree
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(w::h("FOLDERS", 11.5).color(p.nav_weak));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new(ic::FOLDER_PLUS).size(14.0).color(p.nav_weak)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(Vec2::splat(24.0)))
+                        .on_hover_text("New folder")
+                        .clicked()
+                    {
+                        self.folder_dialog = Some(FolderDialog { rename: None, parent: self.folder_filter.clone(), name: String::new() });
+                    }
+                });
+            });
+            if self.vault.folders.is_empty() {
+                ui.label(RichText::new("Create folders to organize your work. Drag items onto a folder to move them.").size(11.5).color(p.nav_weak));
             }
-        }
+            for (folder, depth) in self.folder_rows() {
+                let has_kids = self.vault.folders.iter().any(|f| f.parent.as_deref() == Some(folder.id.as_str()));
+                let open = self.expanded.contains(&folder.id);
+                let count = self.folder_count(&folder.id);
+                let fid = egui::Id::unique("softvault-folder").with(&folder.id);
+                let hover_payload = ui.ctx().dragged_id().is_some() && egui::DragAndDrop::has_payload_of_type::<DragRef>(ui.ctx());
+                let (r, chev) = w::tree_item(
+                    ui,
+                    p,
+                    fid,
+                    &folder.name,
+                    depth,
+                    has_kids.then_some(open),
+                    self.folder_filter.as_deref() == Some(folder.id.as_str()),
+                    count,
+                    false,
+                );
+                // drag folders onto other folders to nest them
+                let drag_r = ui.interact(r.rect, fid.with("drag"), egui::Sense::drag());
+                drag_r.dnd_set_drag_payload(DragRef::Folder(folder.id.clone()));
+                let target = hover_payload && r.contains_pointer();
+                if target {
+                    ui.painter().rect_stroke(r.rect, theme::R_INPUT, Stroke::new(1.5, p.nav_text), egui::StrokeKind::Inside);
+                    // hovering a collapsed folder while dragging opens it after a moment
+                    if has_kids && !open {
+                        let t = ui.ctx().animate_bool_with_time(fid.with("spring"), true, 0.8);
+                        if t >= 1.0 {
+                            self.expanded.insert(folder.id.clone());
+                        }
+                    }
+                }
+                if let Some(pl) = drag_r.dnd_release_payload::<DragRef>().or_else(|| r.dnd_release_payload::<DragRef>()) {
+                    self.move_to_folder(&pl, Some(folder.id.clone()));
+                }
+                if chev {
+                    if open {
+                        self.expanded.remove(&folder.id);
+                    } else {
+                        self.expanded.insert(folder.id.clone());
+                    }
+                } else if r.clicked() || drag_r.clicked() {
+                    self.folder_filter = Some(folder.id.clone());
+                    if self.view != View::Files {
+                        self.view = View::All;
+                    }
+                    if has_kids {
+                        self.expanded.insert(folder.id.clone());
+                    }
+                }
+                let fid_s = folder.id.clone();
+                egui::Popup::context_menu(&r).show(|ui| self.folder_menu(ui, p, &fid_s));
+            }
+
+            // ── tags
+            let tags = self.vault.all_tags();
+            if !tags.is_empty() {
+                ui.add_space(6.0);
+                w::nav_section(ui, p, "TAGS");
+                for (tag, count) in tags {
+                    let sel = self.tag_filter.contains(&tag);
+                    if w::tag_nav_item(ui, p, &tag, sel, count).clicked() {
+                        if sel {
+                            self.tag_filter.remove(&tag);
+                        } else {
+                            self.tag_filter.insert(tag.clone());
+                        }
+                        if !matches!(self.view, View::All | View::Passwords | View::Notes | View::Favorites | View::Files) {
+                            self.view = View::All;
+                        }
+                    }
+                }
+            }
+
+            w::nav_section(ui, p, "TOOLS");
+            if w::nav_item(ui, p, ic::DICES, "Generator", self.view == View::Generator, None).clicked() {
+                self.view = View::Generator;
+            }
+            let issues = self.health().issue_count();
+            if w::nav_item(ui, p, ic::SHIELD_CHECK, "Vault health", self.view == View::Health, (issues > 0).then_some(issues)).clicked() {
+                self.view = View::Health;
+            }
+            w::nav_section(ui, p, "MANAGE");
+            if w::nav_item(ui, p, ic::ARROW_DOWN_UP, "Import & export", self.view == View::Settings && self.su.tab == 3, None).clicked() {
+                self.view = View::Settings;
+                self.su.loaded = false;
+                self.su.tab = 3;
+            }
+            if w::nav_item(ui, p, ic::SETTINGS, "Settings", self.view == View::Settings && self.su.tab != 3, None).clicked() {
+                self.view = View::Settings;
+                self.su.loaded = false;
+                if self.su.tab == 3 {
+                    self.su.tab = 0;
+                }
+            }
+            ui.add_space(8.0);
+        });
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             // account-style footer
@@ -777,7 +917,6 @@ impl SoftVaultApp {
             let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
             ui.painter().rect_filled(line, CornerRadius::ZERO, p.nav_hover);
             ui.add_space(10.0);
-            // segmented theme switch
             Frame::new().fill(p.nav_hover).corner_radius(theme::PILL).inner_margin(Margin::same(3)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -798,6 +937,219 @@ impl SoftVaultApp {
         });
     }
 
+    // ───── folder helpers ─────
+
+    /// Visible folder rows in tree order (children only when the parent is expanded).
+    fn folder_rows(&self) -> Vec<(vault::Folder, usize)> {
+        fn walk(all: &[vault::Folder], parent: Option<&str>, depth: usize, expanded: &std::collections::HashSet<String>, out: &mut Vec<(vault::Folder, usize)>) {
+            let mut kids: Vec<&vault::Folder> = all.iter().filter(|f| f.parent.as_deref() == parent).collect();
+            kids.sort_by_key(|f| f.name.to_lowercase());
+            for f in kids {
+                out.push((f.clone(), depth));
+                if expanded.contains(&f.id) && depth < 12 {
+                    walk(all, Some(&f.id), depth + 1, expanded, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.vault.folders, None, 0, &self.expanded, &mut out);
+        out
+    }
+
+    /// Every folder in tree order (for pickers), regardless of expansion.
+    fn folder_options(&self) -> Vec<(String, String, usize)> {
+        fn walk(all: &[vault::Folder], parent: Option<&str>, depth: usize, out: &mut Vec<(String, String, usize)>) {
+            let mut kids: Vec<&vault::Folder> = all.iter().filter(|f| f.parent.as_deref() == parent).collect();
+            kids.sort_by_key(|f| f.name.to_lowercase());
+            for f in kids {
+                out.push((f.id.clone(), f.name.clone(), depth));
+                if depth < 12 {
+                    walk(all, Some(&f.id), depth + 1, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.vault.folders, None, 0, &mut out);
+        out
+    }
+
+    /// Items + files in a folder and all its sub-folders.
+    fn folder_count(&self, id: &str) -> usize {
+        let mut ids = self.vault.folder_descendants(id);
+        ids.push(id.to_string());
+        let inside = |f: &Option<String>| f.as_ref().is_some_and(|x| ids.contains(x));
+        self.vault.items.iter().filter(|i| inside(&i.data.folder)).count() + self.vault.files.iter().filter(|f| inside(&f.meta.folder)).count()
+    }
+
+    fn in_folder_filter(&self, folder: &Option<String>) -> bool {
+        match &self.folder_filter {
+            None => true,
+            Some(sel) => folder.as_ref().is_some_and(|f| f == sel || self.vault.folder_descendants(sel).contains(f)),
+        }
+    }
+
+    fn has_tags(&self, tags: &[String]) -> bool {
+        self.tag_filter.iter().all(|t| tags.contains(t))
+    }
+
+    fn move_to_folder(&mut self, what: &DragRef, folder: Option<String>) {
+        let dest = folder.as_ref().map(|f| self.vault.folder_path(f)).unwrap_or_else(|| "top level".into());
+        let res = match what {
+            DragRef::Item(id) => self.vault.move_item(id, folder.clone()).map(|_| self.vault.items.iter().find(|i| &i.id == id).map(|i| i.data.title.clone()).unwrap_or_default()),
+            DragRef::File(id) => {
+                let f = folder.clone();
+                self.vault.update_file(id, |m| m.folder = f).map(|_| self.vault.files.iter().find(|x| &x.id == id).map(|x| x.meta.name.clone()).unwrap_or_default())
+            }
+            DragRef::Folder(id) => {
+                if folder.as_deref() == Some(id.as_str()) {
+                    return;
+                }
+                self.vault.move_folder(id, folder.clone()).map(|_| self.vault.folders.iter().find(|f| &f.id == id).map(|f| f.name.clone()).unwrap_or_default())
+            }
+        };
+        match res {
+            Ok(name) => {
+                if let Some(f) = &folder {
+                    self.expanded.insert(f.clone());
+                }
+                self.toast(format!("Moved “{name}” to {dest}"), true)
+            }
+            Err(e) => self.toast(e.to_string(), false),
+        }
+    }
+
+    fn folder_menu(&mut self, ui: &mut egui::Ui, p: &Palette, id: &str) {
+        ui.set_min_width(210.0);
+        ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
+        if ui.button(format!("{}   New subfolder", ic::FOLDER_PLUS)).clicked() {
+            self.folder_dialog = Some(FolderDialog { rename: None, parent: Some(id.to_string()), name: String::new() });
+            ui.close();
+        }
+        if ui.button(format!("{}   Rename", ic::PENCIL)).clicked() {
+            let name = self.vault.folders.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_default();
+            self.folder_dialog = Some(FolderDialog { rename: Some(id.to_string()), parent: None, name });
+            ui.close();
+        }
+        let is_nested = self.vault.folders.iter().find(|f| f.id == id).is_some_and(|f| f.parent.is_some());
+        if is_nested && ui.button(format!("{}   Move to top level", ic::CORNER_DOWN_RIGHT)).clicked() {
+            self.move_to_folder(&DragRef::Folder(id.to_string()), None);
+            ui.close();
+        }
+        ui.separator();
+        let armed = self.confirm_folder_delete.as_deref() == Some(id);
+        let label = if armed { format!("{}   Click again to delete", ic::TRASH_2) } else { format!("{}   Delete folder", ic::TRASH_2) };
+        if ui.button(RichText::new(label).color(p.danger)).on_hover_text("Its contents move to the parent folder").clicked() {
+            if armed {
+                let name = self.vault.folders.iter().find(|f| f.id == id).map(|f| f.name.clone()).unwrap_or_default();
+                match self.vault.delete_folder(id) {
+                    Ok(()) => {
+                        if self.folder_filter.as_deref() == Some(id) {
+                            self.folder_filter = None;
+                        }
+                        self.toast(format!("Folder “{name}” deleted. Its contents moved up."), true);
+                    }
+                    Err(e) => self.toast(e.to_string(), false),
+                }
+                self.confirm_folder_delete = None;
+                ui.close();
+            } else {
+                self.confirm_folder_delete = Some(id.to_string());
+            }
+        }
+    }
+
+    fn ui_folder_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(mut d) = self.folder_dialog.take() else { return };
+        let mut close = false;
+        let mut submit = false;
+        let options = self.folder_options();
+        egui::Modal::new(egui::Id::unique("softvault-folder-dialog"))
+            .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 90 }))
+            .frame(Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.border)).corner_radius(theme::R_CARD).inner_margin(Margin::same(24)).shadow(theme::soft_shadow(p)))
+            .show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.horizontal(|ui| {
+                    w::icon_tile(ui, p, if d.rename.is_some() { ic::PENCIL } else { ic::FOLDER_PLUS }, 36.0);
+                    ui.label(w::h(if d.rename.is_some() { "Rename folder" } else { "New folder" }, 18.0));
+                });
+                ui.add_space(12.0);
+                w::label(ui, p, "Name");
+                let r = ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("e.g. Work, Clients/ACME").desired_width(f32::INFINITY).margin(Margin::symmetric(12, 9)));
+                if !r.has_focus() && d.name.is_empty() {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if d.rename.is_none() {
+                    ui.add_space(8.0);
+                    w::label(ui, p, "Inside");
+                    let current = d.parent.as_ref().map(|id| self.vault.folder_path(id)).unwrap_or_else(|| "Top level".into());
+                    egui::ComboBox::from_id_salt("softvault-folder-parent").width(ui.available_width()).selected_text(current).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.parent, None, "Top level");
+                        for (id, name, depth) in &options {
+                            ui.selectable_value(&mut d.parent, Some(id.clone()), format!("{}{} {name}", "    ".repeat(*depth), ic::FOLDER));
+                        }
+                    });
+                }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if w::primary(ui, p, if d.rename.is_some() { "Rename" } else { "Create" }).clicked() {
+                        submit = true;
+                    }
+                    if w::ghost(ui, p, "Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if submit {
+            if d.name.trim().is_empty() {
+                self.toast("Folder name can't be empty", false);
+            } else {
+                let res = match &d.rename {
+                    Some(id) => self.vault.rename_folder(id, &d.name).map(|_| id.clone()),
+                    None => {
+                        // "A/B/C" creates nested folders in one go
+                        let mut parent = d.parent.clone();
+                        let mut last = Ok(String::new());
+                        for part in d.name.split('/').map(str::trim).filter(|s| !s.is_empty()) {
+                            let existing = self.vault.folders.iter().find(|f| f.parent == parent && f.name.eq_ignore_ascii_case(part)).map(|f| f.id.clone());
+                            let id = match existing {
+                                Some(id) => Ok(id),
+                                None => self.vault.create_folder(part, parent.clone()),
+                            };
+                            match id {
+                                Ok(id) => {
+                                    if let Some(pp) = &parent {
+                                        self.expanded.insert(pp.clone());
+                                    }
+                                    parent = Some(id.clone());
+                                    last = Ok(id);
+                                }
+                                Err(e) => {
+                                    last = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                        last
+                    }
+                };
+                match res {
+                    Ok(_) => self.toast(if d.rename.is_some() { "Folder renamed" } else { "Folder created" }, true),
+                    Err(e) => self.toast(e.to_string(), false),
+                }
+                close = true;
+            }
+        }
+        if !close {
+            self.folder_dialog = Some(d);
+        }
+    }
+
     fn visible_items(&self) -> Vec<Row> {
         let q = self.search.to_lowercase();
         let mut v: Vec<Row> = self
@@ -810,11 +1162,13 @@ impl SoftVaultApp {
                 View::Favorites => i.data.favorite,
                 _ => true,
             })
+            .filter(|i| self.in_folder_filter(&i.data.folder) && self.has_tags(&i.data.tags))
             .filter(|i| {
                 q.is_empty()
                     || i.data.title.to_lowercase().contains(&q)
                     || i.data.username.to_lowercase().contains(&q)
                     || i.data.url.to_lowercase().contains(&q)
+                    || i.data.tags.iter().any(|t| t.contains(q.trim_start_matches('#')))
                     || (i.data.kind == Kind::Note && i.data.notes.to_lowercase().contains(&q))
             })
             .map(|i| {
@@ -846,14 +1200,20 @@ impl SoftVaultApp {
                     updated: i.data.updated,
                     badge: if note { i.data.format.badge() } else { "\u{E4A3}  Login" },
                     note_icon: i.data.format.icon(),
+                    folder: i.data.folder.as_ref().map(|f| self.vault.folder_path(f)).unwrap_or_default(),
+                    tags: i.data.tags.clone(),
+                    views: i.data.views,
                 }
             })
             .collect();
         let (col, asc) = self.sort;
         v.sort_by(|a, b| {
+            let name = || a.title.to_lowercase().cmp(&b.title.to_lowercase());
             let o = match col {
-                w::SortCol::Name => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                w::SortCol::Type => a.badge.cmp(b.badge).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+                w::SortCol::Name => name(),
+                w::SortCol::Folder => a.folder.to_lowercase().cmp(&b.folder.to_lowercase()).then_with(name),
+                w::SortCol::Type => a.badge.cmp(b.badge).then_with(name),
+                w::SortCol::Views => a.views.cmp(&b.views).then_with(name),
                 w::SortCol::Updated => a.updated.cmp(&b.updated),
             };
             if asc { o } else { o.reverse() }
@@ -865,7 +1225,13 @@ impl SoftVaultApp {
         self.selected = None;
         self.editor = Some(Editor {
             id: None,
-            data: ItemData { kind, format: if kind == Kind::Note { NoteFormat::Markdown } else { NoteFormat::Plain }, ..Default::default() },
+            data: ItemData {
+                kind,
+                format: if kind == Kind::Note { NoteFormat::Markdown } else { NoteFormat::Plain },
+                folder: self.folder_filter.clone(),
+                tags: self.tag_filter.iter().cloned().collect(),
+                ..Default::default()
+            },
             show_pw: kind == Kind::Password,
             show_gen: false,
             confirm_delete: false,
@@ -880,6 +1246,7 @@ impl SoftVaultApp {
     }
 
     fn select(&mut self, id: &str) {
+        let _ = self.vault.record_item_view(id);
         if let Some(it) = self.vault.items.iter().find(|i| i.id == id) {
             self.selected = Some(id.to_string());
             self.editor = Some(Editor { id: Some(id.to_string()), data: it.data.clone(), show_pw: false, show_gen: false, confirm_delete: false, note_mode: NoteMode::Preview, opened: Instant::now() });
@@ -889,7 +1256,7 @@ impl SoftVaultApp {
     fn new_item_menu(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let r = w::primary(ui, p, &format!("{}  New", ic::PLUS));
         egui::Popup::menu(&r).show(|ui| {
-            ui.set_min_width(220.0);
+            ui.set_min_width(230.0);
             ui.spacing_mut().button_padding = Vec2::new(10.0, 8.0);
             if ui.button(format!("{}   Login            Ctrl+N", ic::KEY_ROUND)).clicked() {
                 self.new_item(Kind::Password);
@@ -897,6 +1264,11 @@ impl SoftVaultApp {
             }
             if ui.button(format!("{}   Secure note   Ctrl+Shift+N", ic::STICKY_NOTE)).clicked() {
                 self.new_item(Kind::Note);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button(format!("{}   Folder", ic::FOLDER_PLUS)).clicked() {
+                self.folder_dialog = Some(FolderDialog { rename: None, parent: self.folder_filter.clone(), name: String::new() });
                 ui.close();
             }
         });
@@ -908,7 +1280,7 @@ impl SoftVaultApp {
 
     /// Global keyboard shortcuts while the vault is open.
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.editor.is_some() || self.full.is_some() {
+        if self.editor.is_some() || self.full.is_some() || self.folder_dialog.is_some() {
             return;
         }
         let (f, n, sn, l) = ctx.input(|i| {
@@ -937,22 +1309,64 @@ impl SoftVaultApp {
         }
     }
 
+    /// Chips for the active folder / tag filters (shared by the vault and files pages).
+    fn active_filter_chips(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        if let Some(f) = self.folder_filter.clone() {
+            let path = self.vault.folder_path(&f);
+            if w::chip(ui, p, &format!("{}  {path}   {}", ic::FOLDER, ic::X), true).on_hover_text("Clear folder filter").clicked() {
+                self.folder_filter = None;
+            }
+        }
+        for t in self.tag_filter.clone() {
+            if w::chip(ui, p, &format!("#{t}   {}", ic::X), true).on_hover_text("Remove tag filter").clicked() {
+                self.tag_filter.remove(&t);
+            }
+        }
+        let all = self.vault.all_tags();
+        if !all.is_empty() {
+            let r = w::chip(ui, p, &format!("{}  Tags  {}", ic::TAG, ic::CHEVRON_DOWN), false);
+            egui::Popup::menu(&r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                ui.set_min_width(200.0);
+                ui.label(RichText::new("Show items with all selected tags").size(12.0).color(p.weak));
+                ui.separator();
+                for (t, n) in all {
+                    let mut on = self.tag_filter.contains(&t);
+                    if ui.checkbox(&mut on, format!("#{t}  ({n})")).changed() {
+                        if on {
+                            self.tag_filter.insert(t.clone());
+                        } else {
+                            self.tag_filter.remove(&t);
+                        }
+                    }
+                }
+                if !self.tag_filter.is_empty() {
+                    ui.separator();
+                    if ui.button("Clear tag filters").clicked() {
+                        self.tag_filter.clear();
+                        ui.close();
+                    }
+                }
+            });
+        }
+    }
+
     fn ui_vault_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
-        let (title, icon) = match self.view {
-            View::Passwords => ("Logins", ic::KEY_ROUND),
-            View::Notes => ("Secure notes", ic::STICKY_NOTE),
-            View::Favorites => ("Favorites", ic::STAR),
-            _ => ("All items", ic::LAYERS),
+        let (title, icon) = match (&self.folder_filter, self.view) {
+            (Some(f), _) => (self.vault.folder_path(f), ic::FOLDER_OPEN),
+            (None, View::Passwords) => ("Logins".into(), ic::KEY_ROUND),
+            (None, View::Notes) => ("Secure notes".into(), ic::STICKY_NOTE),
+            (None, View::Favorites) => ("Favorites".into(), ic::STAR),
+            _ => ("All items".into(), ic::LAYERS),
         };
         let items = self.visible_items();
         let subtitle = format!(
-            "{} item{} · end-to-end encrypted",
+            "{} item{} · drag rows onto a folder to move them",
             items.len(),
             if items.len() == 1 { "" } else { "s" }
         );
         ui.horizontal(|ui| {
-            w::page_header(ui, p, icon, title, &subtitle);
+            w::page_header(ui, p, icon, &title, &subtitle);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.new_item_menu(ui, p);
                 if w::ghost(ui, p, &format!("{}  Import", ic::UPLOAD)).clicked() {
@@ -964,20 +1378,20 @@ impl SoftVaultApp {
         });
         ui.add_space(16.0);
 
-        // toolbar: search + filter chips
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+        // toolbar: search + type chips + folder/tag filters
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
             ui.add_sized(
-                [340.0, 36.0],
+                [300.0, 36.0],
                 egui::TextEdit::singleline(&mut self.search)
                     .id(Self::search_id())
-                    .hint_text(format!("{}   Search vault        Ctrl+F", ic::SEARCH))
+                    .hint_text(format!("{}   Search name, user, #tag…", ic::SEARCH))
                     .margin(Margin::symmetric(12, 9)),
             );
             if !self.search.is_empty() && w::ghost_icon(ui, p, ic::X, "Clear search").clicked() {
                 self.search.clear();
             }
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             for (v, label) in [
                 (View::All, format!("{}  All", ic::LAYERS)),
                 (View::Passwords, format!("{}  Logins", ic::KEY_ROUND)),
@@ -988,6 +1402,8 @@ impl SoftVaultApp {
                     self.view = v;
                 }
             }
+            ui.add_space(6.0);
+            self.active_filter_chips(ui, p);
         });
         ui.add_space(12.0);
 
@@ -1004,13 +1420,13 @@ impl SoftVaultApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 if let Some(col) = w::table_header(ui, p, self.sort) {
-                    self.sort = if self.sort.0 == col { (col, !self.sort.1) } else { (col, col != w::SortCol::Updated) };
+                    self.sort = if self.sort.0 == col { (col, !self.sort.1) } else { (col, !matches!(col, w::SortCol::Updated | w::SortCol::Views)) };
                 }
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ScrollArea::vertical().id_salt("softvault-table").auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     if items.is_empty() {
                         ui.add_space(64.0);
-                        if self.search.is_empty() {
+                        if self.search.is_empty() && self.folder_filter.is_none() && self.tag_filter.is_empty() {
                             w::empty_state(ui, p, ic::VAULT, "No items yet", "Add a login or a secure note. Everything is encrypted on this device.");
                             ui.vertical_centered(|ui| {
                                 ui.horizontal(|ui| {
@@ -1024,24 +1440,44 @@ impl SoftVaultApp {
                                     }
                                 });
                             });
+                        } else if self.folder_filter.is_some() && self.search.is_empty() {
+                            w::empty_state(ui, p, ic::FOLDER_OPEN, "This folder is empty", "Drag items from “All items” onto the folder in the sidebar, or create a new one here.");
                         } else {
-                            w::empty_state(ui, p, ic::SEARCH, "No matching items", "Try a different search or filter.");
+                            w::empty_state(ui, p, ic::SEARCH, "No matching items", "Try a different search, folder or tag.");
                         }
                     }
                     for row in items {
                         let id = row.id.clone();
                         let sel = self.selected.as_deref() == Some(&id);
-                        let (resp, opt_rect) = w::table_row(ui, p, &row.title, &row.sub, row.note, row.note_icon, row.badge, row.favorite, &fmt(row.updated), sel);
-                        let hovered = ui.rect_contains_pointer(resp.rect);
-                        if row.note && resp.drag_started() {
-                            self.drag_out = Some(DragSource::Note(id.clone()));
-                        }
+                        let date = fmt(row.updated);
+                        let (resp, opt_rect) = w::table_row(
+                            ui,
+                            p,
+                            &w::RowData {
+                                title: &row.title,
+                                subtitle: &row.sub,
+                                note: row.note,
+                                note_icon: row.note_icon,
+                                badge: row.badge,
+                                favorite: row.favorite,
+                                folder: &row.folder,
+                                tags: &row.tags,
+                                views: row.views,
+                                updated: &date,
+                                selected: sel,
+                                drop_target: false,
+                            },
+                        );
+                        // drag onto a sidebar folder to move, or out of the window to export (notes)
+                        resp.dnd_set_drag_payload(DragRef::Item(id.clone()));
+                        let hovered = ui.rect_contains_pointer(resp.rect) && !egui::DragAndDrop::has_any_payload(&ctx);
 
-                        // hover quick actions, just left of the ⋮ button
+                        // Children always exist with stable ids (only their content depends on
+                        // hover), so widget ids — and open menus — don't shift when the mouse moves.
+                        let qa = egui::Rect::from_min_max(egui::pos2(opt_rect.left() - 150.0, opt_rect.top()), egui::pos2(opt_rect.left() - 4.0, opt_rect.bottom()));
+                        let mut q = ui.new_child(egui::UiBuilder::new().id_salt(("softvault-row-qa", &id)).max_rect(qa).layout(Layout::right_to_left(Align::Center)));
+                        q.spacing_mut().item_spacing.x = 2.0;
                         if hovered {
-                            let qa = egui::Rect::from_min_max(egui::pos2(opt_rect.left() - 150.0, opt_rect.top()), egui::pos2(opt_rect.left() - 4.0, opt_rect.bottom()));
-                            let mut q = ui.new_child(egui::UiBuilder::new().max_rect(qa).layout(Layout::right_to_left(Align::Center)));
-                            q.spacing_mut().item_spacing.x = 2.0;
                             let data = self.vault.items.iter().find(|i| i.id == id).map(|i| (i.data.kind, i.data.username.clone(), i.data.password.clone(), i.data.url.clone()));
                             if let Some((kind, user, pw, url)) = data {
                                 if kind == Kind::Password {
@@ -1063,55 +1499,9 @@ impl SoftVaultApp {
                             }
                         }
 
-                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(opt_rect).layout(Layout::left_to_right(Align::Center)));
+                        let mut child = ui.new_child(egui::UiBuilder::new().id_salt(("softvault-row-opt", &id)).max_rect(opt_rect).layout(Layout::left_to_right(Align::Center)));
                         let ob = w::ghost_icon(&mut child, p, ic::ELLIPSIS_VERTICAL, "More options");
-                        let menu = |ui: &mut egui::Ui, s: &mut Self| {
-                            ui.set_min_width(210.0);
-                            ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
-                            let data = s.vault.items.iter().find(|i| i.id == id).map(|i| i.data.clone());
-                            let Some(data) = data else { return };
-                            if data.kind == Kind::Password {
-                                if ui.button(format!("{}   Copy username", ic::USER)).clicked() {
-                                    s.copy(&ctx, &data.username, "Username");
-                                    ui.close();
-                                }
-                                if ui.button(format!("{}   Copy password", ic::KEY_ROUND)).clicked() {
-                                    s.copy(&ctx, &data.password, "Password");
-                                    ui.close();
-                                }
-                            } else {
-                                if ui.button(format!("{}   Copy note", ic::COPY)).clicked() {
-                                    s.copy(&ctx, &data.notes, "Note");
-                                    ui.close();
-                                }
-                                if ui.button(format!("{}   Open full screen", ic::MAXIMIZE_2)).clicked() {
-                                    s.open_fullscreen(Some(id.clone()));
-                                    ui.close();
-                                }
-                                if ui.button(format!("{}   Save decrypted copy…", ic::DOWNLOAD)).clicked() {
-                                    ui.close();
-                                    s.save_decrypted(DragSource::Note(id.clone()));
-                                }
-                            }
-                            if ui.button(format!("{}   Edit", ic::PENCIL)).clicked() {
-                                s.select(&id);
-                                ui.close();
-                            }
-                            if ui.button(format!("{}   {}", ic::STAR, if data.favorite { "Remove from favorites" } else { "Add to favorites" })).clicked() {
-                                let mut d = data.clone();
-                                d.favorite = !d.favorite;
-                                let _ = s.vault.save_item(Some(id.clone()), d);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui.button(RichText::new(format!("{}   Delete", ic::TRASH_2)).color(p.danger)).clicked() {
-                                s.select(&id);
-                                if let Some(e) = &mut s.editor {
-                                    e.confirm_delete = true;
-                                }
-                                ui.close();
-                            }
-                        };
+                        let menu = |ui: &mut egui::Ui, s: &mut Self| s.item_menu(ui, p, &ctx, &id);
                         egui::Popup::menu(&ob).show(|ui| menu(ui, self));
                         egui::Popup::context_menu(&resp).show(|ui| menu(ui, self));
                         if resp.clicked() {
@@ -1120,6 +1510,72 @@ impl SoftVaultApp {
                     }
                 });
             });
+    }
+
+    fn item_menu(&mut self, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context, id: &str) {
+        ui.set_min_width(220.0);
+        ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
+        let Some(data) = self.vault.items.iter().find(|i| i.id == id).map(|i| i.data.clone()) else { return };
+        if data.kind == Kind::Password {
+            if ui.button(format!("{}   Copy username", ic::USER)).clicked() {
+                self.copy(ctx, &data.username, "Username");
+                ui.close();
+            }
+            if ui.button(format!("{}   Copy password", ic::KEY_ROUND)).clicked() {
+                self.copy(ctx, &data.password, "Password");
+                ui.close();
+            }
+        } else {
+            if ui.button(format!("{}   Copy note", ic::COPY)).clicked() {
+                self.copy(ctx, &data.notes, "Note");
+                ui.close();
+            }
+            if ui.button(format!("{}   Open full screen", ic::MAXIMIZE_2)).clicked() {
+                self.open_fullscreen(Some(id.to_string()));
+                ui.close();
+            }
+            if ui.button(format!("{}   Save decrypted copy…", ic::DOWNLOAD)).clicked() {
+                ui.close();
+                self.save_decrypted(DragSource::Note(id.to_string()));
+            }
+        }
+        if ui.button(format!("{}   Edit", ic::PENCIL)).clicked() {
+            self.select(id);
+            ui.close();
+        }
+        if ui.button(format!("{}   {}", ic::STAR, if data.favorite { "Remove from favorites" } else { "Add to favorites" })).clicked() {
+            let mut d = data.clone();
+            d.favorite = !d.favorite;
+            let _ = self.vault.store_item(Some(id.to_string()), d, false);
+            ui.close();
+        }
+        // Move to folder
+        let options = self.folder_options();
+        ui.menu_button(format!("{}   Move to folder", ic::FOLDER_INPUT), |ui| {
+            ui.set_min_width(200.0);
+            if ui.add_enabled(data.folder.is_some(), egui::Button::new(format!("{}  No folder", ic::LAYERS))).clicked() {
+                self.move_to_folder(&DragRef::Item(id.to_string()), None);
+                ui.close();
+            }
+            for (fid, name, depth) in &options {
+                let here = data.folder.as_deref() == Some(fid.as_str());
+                if ui.add_enabled(!here, egui::Button::new(format!("{}{}  {name}", "    ".repeat(*depth), ic::FOLDER))).clicked() {
+                    self.move_to_folder(&DragRef::Item(id.to_string()), Some(fid.clone()));
+                    ui.close();
+                }
+            }
+            if options.is_empty() {
+                ui.label(RichText::new("No folders yet").color(p.weak));
+            }
+        });
+        ui.separator();
+        if ui.button(RichText::new(format!("{}   Delete", ic::TRASH_2)).color(p.danger)).clicked() {
+            self.select(id);
+            if let Some(e) = &mut self.editor {
+                e.confirm_delete = true;
+            }
+            ui.close();
+        }
     }
 
     // ─────────────────────────── secure files & drag-and-drop ───────────────────────────
@@ -1169,9 +1625,21 @@ impl SoftVaultApp {
             } else {
                 None
             };
+            let folder = self.folder_filter.clone();
+            let tags: Vec<String> = self.tag_filter.iter().cloned().collect();
             let result = match as_note {
-                Some(note) => self.vault.save_item(None, note).map(|_| notes += 1),
-                None => self.vault.add_file(&name, &bytes, None).map(|_| stored += 1),
+                Some(mut note) => {
+                    note.folder = folder;
+                    note.tags = tags;
+                    self.vault.save_item(None, note).map(|_| notes += 1)
+                }
+                None => self.vault.add_file(&name, &bytes, None).and_then(|id| {
+                    stored += 1;
+                    self.vault.update_file(&id, |m| {
+                        m.folder = folder;
+                        m.tags = tags;
+                    })
+                }),
             };
             match result {
                 Ok(()) => {
@@ -1232,6 +1700,9 @@ impl SoftVaultApp {
                 return;
             }
         };
+        if let DragSource::File(id) = &src {
+            let _ = self.vault.record_file_view(id);
+        }
         match transfer::start_drag_out(frame, vec![path]) {
             Ok(true) => self.toast(format!("Decrypted copy of “{name}” saved"), true),
             Ok(false) => {}
@@ -1248,6 +1719,9 @@ impl SoftVaultApp {
         };
         match payload {
             Some(Ok((name, bytes))) => {
+                if let DragSource::File(id) = &src {
+                    let _ = self.vault.record_file_view(id);
+                }
                 if let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() {
                     match std::fs::write(&path, &*bytes) {
                         Ok(()) => self.toast(format!("Decrypted copy saved to {}", path.display()), true),
@@ -1263,8 +1737,12 @@ impl SoftVaultApp {
     fn ui_files(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let total: u64 = self.vault.files.iter().map(|f| f.meta.size).sum();
         let n = self.vault.files.len();
+        let title = match &self.folder_filter {
+            Some(f) => format!("Secure files · {}", self.vault.folder_path(f)),
+            None => "Secure files".into(),
+        };
         ui.horizontal(|ui| {
-            w::page_header(ui, p, ic::FOLDER_LOCK, "Secure files", &format!("{n} file{} · {} encrypted", if n == 1 { "" } else { "s" }, transfer::human_size(total)));
+            w::page_header(ui, p, ic::FOLDER_LOCK, &title, &format!("{n} file{} · {} encrypted", if n == 1 { "" } else { "s" }, transfer::human_size(total)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if w::primary(ui, p, &format!("{}  Add files", ic::PLUS)).clicked()
                     && let Some(paths) = rfd::FileDialog::new().pick_files()
@@ -1320,7 +1798,12 @@ impl SoftVaultApp {
             if changed {
                 let _ = self.vault.save_settings();
             }
-            ui.add_space(14.0);
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                self.active_filter_chips(ui, p);
+            });
+            ui.add_space(10.0);
 
             // ── grid of encrypted files
             if self.vault.files.is_empty() {
@@ -1328,13 +1811,20 @@ impl SoftVaultApp {
                 w::empty_state(ui, p, ic::FOLDER_LOCK, "No files yet", "Anything you drop above is encrypted with your vault key before it's saved.");
                 return;
             }
-            let mut files = self.vault.files.clone();
+            let mut files: Vec<vault::VaultFile> = self.vault.files.iter().filter(|f| self.in_folder_filter(&f.meta.folder) && self.has_tags(&f.meta.tags)).cloned().collect();
             files.sort_by_key(|f| std::cmp::Reverse(f.meta.created));
+            if files.is_empty() {
+                ui.add_space(20.0);
+                w::empty_state(ui, p, ic::FOLDER_OPEN, "No files here", "Drop files above. They'll be added to the selected folder.");
+                return;
+            }
+            let tag_suggestions: Vec<String> = self.vault.all_tags().into_iter().map(|(t, _)| t).collect();
+            let folder_options = self.folder_options();
             let gap = 14.0;
             let avail = ui.available_width();
             let cols = ((avail + gap) / (220.0 + gap)).floor().max(1.0) as usize;
             let card_w = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
-            let card = Vec2::new(card_w, 176.0);
+            let card = Vec2::new(card_w, 196.0);
             for chunk in files.chunks(cols) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
@@ -1343,13 +1833,38 @@ impl SoftVaultApp {
                         let date = chrono::DateTime::from_timestamp(f.meta.created, 0)
                             .map(|d| d.with_timezone(&chrono::Local).format("%b %d, %Y").to_string())
                             .unwrap_or_default();
-                        let info = format!("{} · {date}", transfer::human_size(f.meta.size));
-                        let (resp, actions) = w::file_card(ui, p, icon, tone(p), &f.meta.name, &info, card);
-                        if resp.drag_started() {
-                            self.drag_out = Some(DragSource::File(f.id.clone()));
-                        }
-                        let resp = resp.on_hover_text("Drag out of the window to save a decrypted copy");
-                        let mut a = ui.new_child(egui::UiBuilder::new().max_rect(actions).layout(Layout::left_to_right(Align::Center)));
+                        let info = format!("{} · {date} · {} {}", transfer::human_size(f.meta.size), ic::EYE, f.meta.views);
+                        let folder = f.meta.folder.as_ref().map(|x| self.vault.folder_path(x)).unwrap_or_default();
+                        let cid = egui::Id::unique("softvault-file-card").with(&f.id);
+                        let (resp, actions) = w::file_card(ui, p, cid, icon, tone(p), &f.meta.name, &info, &folder, &f.meta.tags, card);
+                        resp.dnd_set_drag_payload(DragRef::File(f.id.clone()));
+                        let resp = resp.on_hover_text("Drag onto a folder to move · drag outside the window for a decrypted copy · right-click for more");
+                        // right-click: move to folder / edit tags
+                        let fid = f.id.clone();
+                        egui::Popup::context_menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                            ui.set_min_width(240.0);
+                            ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
+                            ui.menu_button(format!("{}   Move to folder", ic::FOLDER_INPUT), |ui| {
+                                ui.set_min_width(200.0);
+                                if ui.button(format!("{}  No folder", ic::LAYERS)).clicked() {
+                                    self.move_to_folder(&DragRef::File(fid.clone()), None);
+                                    ui.close();
+                                }
+                                for (id, name, depth) in &folder_options {
+                                    if ui.button(format!("{}{}  {name}", "    ".repeat(*depth), ic::FOLDER)).clicked() {
+                                        self.move_to_folder(&DragRef::File(fid.clone()), Some(id.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            ui.separator();
+                            ui.label(RichText::new(format!("{}  Tags", ic::TAG)).size(12.5).color(p.weak));
+                            let mut tags = self.vault.files.iter().find(|x| x.id == fid).map(|x| x.meta.tags.clone()).unwrap_or_default();
+                            if w::tag_editor(ui, p, &format!("softvault-file-tags-{fid}"), &mut tags, &tag_suggestions) {
+                                let _ = self.vault.update_file(&fid, |m| m.tags = tags);
+                            }
+                        });
+                        let mut a = ui.new_child(egui::UiBuilder::new().id_salt(("softvault-file-actions", &f.id)).max_rect(actions).layout(Layout::left_to_right(Align::Center)));
                         a.spacing_mut().item_spacing.x = 6.0;
                         if w::ghost(&mut a, p, &format!("{}  Save", ic::DOWNLOAD)).on_hover_text("Save a decrypted copy…").clicked() {
                             self.save_decrypted(DragSource::File(f.id.clone()));
@@ -1389,6 +1904,68 @@ impl SoftVaultApp {
                 ic::INFO
             )).size(12.5).color(p.weak));
         });
+    }
+
+    /// Label that follows the cursor during an internal drag; dragging past the
+    /// window edge turns it into a native "drag out" (decrypted copy).
+    fn ui_drag_ghost(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(payload) = egui::DragAndDrop::payload::<DragRef>(ctx) else { return };
+        let (pos, down) = ctx.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+        let screen = ctx.content_rect();
+        let outside = down && pos.is_none_or(|p| !screen.shrink(2.0).contains(p));
+        if outside {
+            let src = match &*payload {
+                DragRef::Item(id) => self.vault.items.iter().find(|i| &i.id == id).filter(|i| i.data.kind == Kind::Note).map(|_| DragSource::Note(id.clone())),
+                DragRef::File(id) => Some(DragSource::File(id.clone())),
+                DragRef::Folder(_) => None,
+            };
+            egui::DragAndDrop::clear_payload(ctx);
+            match src {
+                Some(src) => self.drag_out = Some(src),
+                None => self.toast("Only notes and files can be dragged out of the vault.", false),
+            }
+            return;
+        }
+        let Some(pos) = pos else { return };
+        let (icon, name) = match &*payload {
+            DragRef::Item(id) => self
+                .vault
+                .items
+                .iter()
+                .find(|i| &i.id == id)
+                .map(|i| (if i.data.kind == Kind::Note { i.data.format.icon() } else { ic::KEY_ROUND }, i.data.title.clone()))
+                .unwrap_or((ic::FILE, String::new())),
+            DragRef::File(id) => self.vault.files.iter().find(|f| &f.id == id).map(|f| (ic::FILE, f.meta.name.clone())).unwrap_or((ic::FILE, String::new())),
+            DragRef::Folder(id) => (ic::FOLDER, self.vault.folders.iter().find(|f| &f.id == id).map(|f| f.name.clone()).unwrap_or_default()),
+        };
+        let hint = match &*payload {
+            DragRef::Folder(_) => "Drop on a folder to nest it",
+            DragRef::Item(id) if self.vault.items.iter().any(|i| &i.id == id && i.data.kind == Kind::Password) => "Drop on a folder to move",
+            _ => "Drop on a folder · drag outside to export",
+        };
+        egui::Area::new(egui::Id::unique("softvault-drag-ghost"))
+            .fixed_pos(pos + Vec2::new(14.0, 10.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0, p.accent))
+                    .corner_radius(theme::R_INPUT)
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .shadow(theme::soft_shadow(p))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon).color(p.accent).size(14.0));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(w::h(name, 13.0));
+                                ui.label(RichText::new(hint).size(11.5).color(p.weak));
+                            });
+                        });
+                    });
+            });
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     }
 
     /// Full-window overlay while files are dragged over SoftVault.
@@ -1778,6 +2355,11 @@ impl SoftVaultApp {
     // ─────────────────────────── full-screen note reader ───────────────────────────
 
     fn open_fullscreen(&mut self, item_id: Option<String>) {
+        if self.editor.is_none()
+            && let Some(id) = &item_id
+        {
+            let _ = self.vault.record_item_view(id);
+        }
         self.full = Some(FullView { item_id, zoom: 1.0, os_fullscreen: false, show_toc: true });
     }
 
@@ -1948,6 +2530,8 @@ impl SoftVaultApp {
         let mut save = false;
         let mut delete = false;
         let max_body = (ctx.content_rect().height() - 220.0).max(240.0);
+        let folder_options = self.folder_options();
+        let tag_suggestions: Vec<String> = self.vault.all_tags().into_iter().map(|(t, _)| t).collect();
         let is_note = ed.data.kind == Kind::Note;
 
         let fade = (ed.opened.elapsed().as_secs_f32() / 0.18).min(1.0);
@@ -2000,6 +2584,22 @@ impl SoftVaultApp {
                             ui.label(w::h(format!("{}  Item details", ic::INFO), 15.0));
                             w::label(ui, p, "Item name (required)");
                             w::text_input(ui, &mut ed.data.title, if is_note { "e.g. Recovery codes" } else { "e.g. GitHub" }, false);
+                            ui.add_space(2.0);
+                            ui.columns(2, |c| {
+                                w::label(&mut c[0], p, "Folder");
+                                let current = ed.data.folder.as_ref().map(|f| self.vault.folder_path(f)).unwrap_or_else(|| "No folder".into());
+                                egui::ComboBox::from_id_salt("softvault-item-folder")
+                                    .width(c[0].available_width())
+                                    .selected_text(format!("{}  {current}", ic::FOLDER))
+                                    .show_ui(&mut c[0], |ui| {
+                                        ui.selectable_value(&mut ed.data.folder, None, "No folder");
+                                        for (id, name, depth) in &folder_options {
+                                            ui.selectable_value(&mut ed.data.folder, Some(id.clone()), format!("{}{}  {name}", "    ".repeat(*depth), ic::FOLDER));
+                                        }
+                                    });
+                                w::label(&mut c[1], p, "Tags");
+                                w::tag_editor(&mut c[1], p, "softvault-item-tags", &mut ed.data.tags, &tag_suggestions);
+                            });
                         });
 
                         if !is_note {
@@ -2092,7 +2692,8 @@ impl SoftVaultApp {
                                     .map(|d| d.with_timezone(&chrono::Local).format("%b %d, %Y, %H:%M").to_string())
                                     .unwrap_or_default()
                             };
-                            ui.label(RichText::new(format!("Created: {}    Last edited: {}", fmt(ed.data.created), fmt(ed.data.updated))).size(12.0).color(p.weak));
+                            let viewed = if ed.data.last_viewed > 0 { format!("    {}  Viewed {} time{} · last {}", ic::EYE, ed.data.views, if ed.data.views == 1 { "" } else { "s" }, fmt(ed.data.last_viewed)) } else { String::new() };
+                            ui.label(RichText::new(format!("Created: {}    Last edited: {}{viewed}", fmt(ed.data.created), fmt(ed.data.updated))).size(12.0).color(p.weak));
                         }
                     });
                 });
@@ -2779,6 +3380,7 @@ impl eframe::App for SoftVaultApp {
             }
         }
         if self.screen == Screen::Main {
+            self.ui_drag_ghost(&ctx, &p);
             self.ui_drop_overlay(&ctx, &p);
             // ── drag & drop out: decrypted copy handed to the OS
             self.process_drag_out(&ctx, frame);

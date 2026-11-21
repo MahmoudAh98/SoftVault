@@ -97,6 +97,11 @@ impl Db {
         Ok(())
     }
 
+    pub fn update_file_meta(&self, id: &str, meta: &[u8]) -> Result<()> {
+        self.conn.execute("UPDATE files SET meta = ?2 WHERE id = ?1", params![id, meta])?;
+        Ok(())
+    }
+
     pub fn delete_file(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
         Ok(())

@@ -1,7 +1,7 @@
 //! High level vault: ties crypto + SQLite together and keeps decrypted data in
 //! memory only while unlocked (wiped with `zeroize` on lock).
 
-use crate::crypto::{self, Key, KdfParams, NewVaultMaterial, AAD_SETTINGS};
+use crate::crypto::{self, Key, KdfParams, NewVaultMaterial, AAD_FOLDERS, AAD_SETTINGS};
 use crate::db::Db;
 use crate::protect;
 use anyhow::{anyhow, Context, Result};
@@ -37,6 +37,12 @@ pub struct ItemData {
     pub favorite: bool,
     pub created: i64,
     pub updated: i64,
+    /// Folder id (None = not in a folder)
+    pub folder: Option<String>,
+    pub tags: Vec<String>,
+    /// How many times the item was opened, and when last
+    pub views: u64,
+    pub last_viewed: i64,
 }
 
 #[derive(Clone)]
@@ -87,6 +93,19 @@ pub struct FileMeta {
     pub name: String,
     pub size: u64,
     pub created: i64,
+    pub folder: Option<String>,
+    pub tags: Vec<String>,
+    pub views: u64,
+    pub last_viewed: i64,
+}
+
+/// A folder in the user's hierarchy (stored encrypted as one blob).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Zeroize)]
+#[serde(default)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+    pub parent: Option<String>,
 }
 
 #[derive(Clone)]
@@ -99,6 +118,10 @@ pub struct VaultFile {
 pub struct ExportFile {
     pub name: String,
     pub created: i64,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// base64 content
     pub data: String,
 }
@@ -112,6 +135,8 @@ pub struct PlainExport {
     pub items: Vec<ItemData>,
     #[serde(default)]
     pub files: Vec<ExportFile>,
+    #[serde(default)]
+    pub folders: Vec<Folder>,
 }
 
 /// Largest single file accepted into the vault.
@@ -130,6 +155,7 @@ pub struct Vault {
     key: Option<Key>,
     pub items: Vec<Item>,
     pub files: Vec<VaultFile>,
+    pub folders: Vec<Folder>,
     pub settings: SecureSettings,
 }
 
@@ -200,6 +226,7 @@ impl Vault {
             key: None,
             items: Vec::new(),
             files: Vec::new(),
+            folders: Vec::new(),
             settings: SecureSettings::default(),
         })
     }
@@ -261,9 +288,14 @@ impl Vault {
             let meta: FileMeta = serde_json::from_slice(&pt)?;
             files.push(VaultFile { id, meta });
         }
+        let folders: Vec<Folder> = match self.db.get_meta("folders")? {
+            Some(blob) => serde_json::from_slice(&crypto::open(&key, &blob, AAD_FOLDERS)?)?,
+            None => Vec::new(),
+        };
         self.settings = settings;
         self.items = items;
         self.files = files;
+        self.folders = folders;
         self.key = Some(key);
         Ok(())
     }
@@ -277,6 +309,10 @@ impl Vault {
             f.meta.zeroize();
         }
         self.files.clear();
+        for f in self.folders.iter_mut() {
+            f.zeroize();
+        }
+        self.folders.clear();
         self.settings.zeroize();
         self.settings = SecureSettings::default();
         self.key = None; // Zeroizing wipes the key on drop
@@ -292,13 +328,21 @@ impl Vault {
         self.db.set_meta("settings", &blob)
     }
 
-    pub fn save_item(&mut self, id: Option<String>, mut data: ItemData) -> Result<String> {
+    pub fn save_item(&mut self, id: Option<String>, data: ItemData) -> Result<String> {
+        self.store_item(id, data, true)
+    }
+
+    /// `touch` = bump the "updated" timestamp (false for view counts / moving).
+    pub fn store_item(&mut self, id: Option<String>, mut data: ItemData, touch: bool) -> Result<String> {
         let id = id.unwrap_or_else(new_id);
         let now = now_ts();
         if data.created == 0 {
             data.created = now;
         }
-        data.updated = now;
+        if touch || data.updated == 0 {
+            data.updated = now;
+        }
+        data.tags = normalize_tags(&data.tags);
         let pt = Zeroizing::new(serde_json::to_vec(&data)?);
         let blob = crypto::seal(self.key()?, &pt, &item_aad(&id))?;
         self.db.upsert_item(&id, &blob)?;
@@ -309,13 +353,149 @@ impl Vault {
         Ok(id)
     }
 
+    /// Count an opening of an item (doesn't change "updated").
+    pub fn record_item_view(&mut self, id: &str) -> Result<()> {
+        let Some(mut d) = self.items.iter().find(|i| i.id == id).map(|i| i.data.clone()) else { return Ok(()) };
+        d.views += 1;
+        d.last_viewed = now_ts();
+        self.store_item(Some(id.to_string()), d, false).map(|_| ())
+    }
+
+    /// Move an item into a folder (None = top level).
+    pub fn move_item(&mut self, id: &str, folder: Option<String>) -> Result<()> {
+        let Some(mut d) = self.items.iter().find(|i| i.id == id).map(|i| i.data.clone()) else { return Ok(()) };
+        d.folder = folder;
+        self.store_item(Some(id.to_string()), d, false).map(|_| ())
+    }
+
+    fn write_file_meta(&mut self, id: &str, meta: FileMeta) -> Result<()> {
+        let blob = crypto::seal(self.key()?, &Zeroizing::new(serde_json::to_vec(&meta)?), &file_meta_aad(id))?;
+        self.db.update_file_meta(id, &blob)?;
+        if let Some(f) = self.files.iter_mut().find(|f| f.id == id) {
+            f.meta = meta;
+        }
+        Ok(())
+    }
+
+    pub fn update_file(&mut self, id: &str, edit: impl FnOnce(&mut FileMeta)) -> Result<()> {
+        let Some(mut meta) = self.files.iter().find(|f| f.id == id).map(|f| f.meta.clone()) else { return Ok(()) };
+        edit(&mut meta);
+        meta.tags = normalize_tags(&meta.tags);
+        self.write_file_meta(id, meta)
+    }
+
+    pub fn record_file_view(&mut self, id: &str) -> Result<()> {
+        self.update_file(id, |m| {
+            m.views += 1;
+            m.last_viewed = now_ts();
+        })
+    }
+
+    // ───── folders ─────
+
+    fn save_folders(&mut self) -> Result<()> {
+        let pt = Zeroizing::new(serde_json::to_vec(&self.folders)?);
+        let blob = crypto::seal(self.key()?, &pt, AAD_FOLDERS)?;
+        self.db.set_meta("folders", &blob)
+    }
+
+    pub fn create_folder(&mut self, name: &str, parent: Option<String>) -> Result<String> {
+        let id = new_id();
+        self.folders.push(Folder { id: id.clone(), name: name.trim().to_string(), parent });
+        self.save_folders()?;
+        Ok(id)
+    }
+
+    pub fn rename_folder(&mut self, id: &str, name: &str) -> Result<()> {
+        if let Some(f) = self.folders.iter_mut().find(|f| f.id == id) {
+            f.name = name.trim().to_string();
+        }
+        self.save_folders()
+    }
+
+    /// Re-parent a folder (refuses to create cycles).
+    pub fn move_folder(&mut self, id: &str, parent: Option<String>) -> Result<()> {
+        if let Some(p) = &parent
+            && (p == id || self.folder_descendants(id).contains(p))
+        {
+            return Err(anyhow!("a folder can't be moved into itself"));
+        }
+        if let Some(f) = self.folders.iter_mut().find(|f| f.id == id) {
+            f.parent = parent;
+        }
+        self.save_folders()
+    }
+
+    /// Delete a folder; its items, files and sub-folders move up to its parent.
+    pub fn delete_folder(&mut self, id: &str) -> Result<()> {
+        let parent = self.folders.iter().find(|f| f.id == id).and_then(|f| f.parent.clone());
+        let item_ids: Vec<String> = self.items.iter().filter(|i| i.data.folder.as_deref() == Some(id)).map(|i| i.id.clone()).collect();
+        for iid in item_ids {
+            self.move_item(&iid, parent.clone())?;
+        }
+        let file_ids: Vec<String> = self.files.iter().filter(|f| f.meta.folder.as_deref() == Some(id)).map(|f| f.id.clone()).collect();
+        for fid in file_ids {
+            let p = parent.clone();
+            self.update_file(&fid, |m| m.folder = p)?;
+        }
+        for f in self.folders.iter_mut().filter(|f| f.parent.as_deref() == Some(id)) {
+            f.parent = parent.clone();
+        }
+        self.folders.retain(|f| f.id != id);
+        self.save_folders()
+    }
+
+    /// All folder ids below `id` (not including `id`).
+    pub fn folder_descendants(&self, id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![id.to_string()];
+        while let Some(cur) = stack.pop() {
+            for f in self.folders.iter().filter(|f| f.parent.as_deref() == Some(cur.as_str())) {
+                out.push(f.id.clone());
+                stack.push(f.id.clone());
+            }
+        }
+        out
+    }
+
+    /// "Parent / Child / Grandchild"
+    pub fn folder_path(&self, id: &str) -> String {
+        let mut parts = Vec::new();
+        let mut cur = Some(id.to_string());
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            match self.folders.iter().find(|f| f.id == c) {
+                Some(f) => {
+                    parts.push(f.name.clone());
+                    cur = f.parent.clone();
+                }
+                None => break,
+            }
+        }
+        parts.reverse();
+        parts.join(" / ")
+    }
+
+    /// All tags in use with counts, sorted by name.
+    pub fn all_tags(&self) -> Vec<(String, usize)> {
+        let mut map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for t in self.items.iter().flat_map(|i| i.data.tags.iter()).chain(self.files.iter().flat_map(|f| f.meta.tags.iter())) {
+            *map.entry(t.clone()).or_default() += 1;
+        }
+        map.into_iter().collect()
+    }
+
     /// Encrypt `bytes` and store them as a vault file.
     pub fn add_file(&mut self, name: &str, bytes: &[u8], created: Option<i64>) -> Result<String> {
         if bytes.len() as u64 > MAX_FILE_BYTES {
             return Err(anyhow!("{name} is larger than {} MB", MAX_FILE_BYTES / 1024 / 1024));
         }
         let id = new_id();
-        let meta = FileMeta { name: name.to_string(), size: bytes.len() as u64, created: created.unwrap_or_else(now_ts) };
+        let meta = FileMeta { name: name.to_string(), size: bytes.len() as u64, created: created.unwrap_or_else(now_ts), ..Default::default() };
         let key = self.key()?;
         let meta_blob = crypto::seal(key, &Zeroizing::new(serde_json::to_vec(&meta)?), &file_meta_aad(&id))?;
         let data_blob = crypto::seal(key, bytes, &file_data_aad(&id))?;
@@ -417,9 +597,16 @@ impl Vault {
                 .iter()
                 .map(|f| -> Result<ExportFile> {
                     use base64::{engine::general_purpose::STANDARD, Engine};
-                    Ok(ExportFile { name: f.meta.name.clone(), created: f.meta.created, data: STANDARD.encode(&*self.read_file(&f.id)?) })
+                    Ok(ExportFile {
+                        name: f.meta.name.clone(),
+                        created: f.meta.created,
+                        folder: f.meta.folder.clone(),
+                        tags: f.meta.tags.clone(),
+                        data: STANDARD.encode(&*self.read_file(&f.id)?),
+                    })
                 })
                 .collect::<Result<_>>()?,
+            folders: self.folders.clone(),
         };
         Ok(Zeroizing::new(serde_json::to_vec_pretty(&e)?))
     }
@@ -428,16 +615,51 @@ impl Vault {
     pub fn import_export(&mut self, e: PlainExport) -> Result<(usize, usize)> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         let (n_items, n_files) = (e.items.len(), e.files.len());
+        // recreate folders with fresh ids, keeping the hierarchy
+        let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in &e.folders {
+            map.insert(f.id.clone(), new_id());
+        }
+        for f in &e.folders {
+            self.folders.push(Folder {
+                id: map[&f.id].clone(),
+                name: f.name.clone(),
+                parent: f.parent.as_ref().and_then(|p| map.get(p).cloned()),
+            });
+        }
+        if !e.folders.is_empty() {
+            self.save_folders()?;
+        }
+        let remap = |f: &Option<String>| f.as_ref().and_then(|id| map.get(id).cloned());
         for mut d in e.items {
             d.created = if d.created == 0 { now_ts() } else { d.created };
+            d.folder = remap(&d.folder);
             self.save_item(None, d)?;
         }
         for f in e.files {
             let bytes = Zeroizing::new(STANDARD.decode(f.data.as_bytes())?);
-            self.add_file(&f.name, &bytes, Some(f.created))?;
+            let id = self.add_file(&f.name, &bytes, Some(f.created))?;
+            let (folder, tags) = (remap(&f.folder), f.tags.clone());
+            self.update_file(&id, |m| {
+                m.folder = folder;
+                m.tags = tags;
+            })?;
         }
         Ok((n_items, n_files))
     }
+}
+
+/// Trim, lowercase, de-duplicate and sort tags.
+pub fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = tags
+        .iter()
+        .map(|t| t.trim().trim_start_matches('#').to_lowercase().replace(char::is_whitespace, "-"))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(32).collect())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Parse a plaintext export (or the decrypted inner payload of an encrypted one).
@@ -501,6 +723,51 @@ mod tests {
         let m = v.unlock_material().unwrap();
         let k = crypto::unwrap_vault_key(b"correct horse battery", &m.params, &m.salt, &m.wrapped).unwrap();
         assert!(v.finish_unlock(k).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn folders_tags_views() {
+        let dir = std::env::temp_dir().join(format!("sv-folders-{}-{}", now_ts(), std::process::id()));
+        let mut v = Vault::open(&dir.join("vault.db")).unwrap();
+        v.finish_create(crypto::build_new_vault(b"correct horse battery").unwrap()).unwrap();
+        let work = v.create_folder("Work", None).unwrap();
+        let client = v.create_folder("ACME", Some(work.clone())).unwrap();
+        assert_eq!(v.folder_path(&client), "Work / ACME");
+        assert!(v.move_folder(&work, Some(client.clone())).is_err(), "cycles must be refused");
+
+        let id = v
+            .save_item(None, ItemData { title: "API".into(), tags: vec![" Prod ".into(), "#prod".into(), "Client A".into()], ..Default::default() })
+            .unwrap();
+        let it = v.items.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(it.data.tags, vec!["client-a".to_string(), "prod".to_string()]);
+        v.move_item(&id, Some(client.clone())).unwrap();
+        let updated = v.items.iter().find(|i| i.id == id).unwrap().data.updated;
+        v.record_item_view(&id).unwrap();
+        v.record_item_view(&id).unwrap();
+        let it = v.items.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(it.data.views, 2);
+        assert_eq!(it.data.updated, updated, "views must not change 'updated'");
+
+        // folders survive lock/unlock (encrypted blob)
+        v.lock();
+        let m = v.unlock_material().unwrap();
+        let k = crypto::unwrap_vault_key(b"correct horse battery", &m.params, &m.salt, &m.wrapped).unwrap();
+        v.finish_unlock(k).unwrap();
+        assert_eq!(v.folders.len(), 2);
+
+        // export → import keeps the hierarchy with fresh ids
+        let e = parse_plain_export(&v.export_json().unwrap()).unwrap();
+        v.import_export(e).unwrap();
+        assert_eq!(v.folders.len(), 4);
+        let copy = v.items.iter().find(|i| i.id != id).unwrap();
+        let cf = copy.data.folder.clone().unwrap();
+        assert_ne!(cf, client);
+        assert_eq!(v.folder_path(&cf), "Work / ACME");
+
+        // deleting a folder moves its content to the parent
+        v.delete_folder(&client).unwrap();
+        assert_eq!(v.items.iter().find(|i| i.id == id).unwrap().data.folder.as_deref(), Some(work.as_str()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
