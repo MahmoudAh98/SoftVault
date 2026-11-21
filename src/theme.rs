@@ -123,10 +123,24 @@ pub fn install_fonts(ctx: &egui::Context) {
         "inter-semibold".into(),
         Arc::new(FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf"))),
     );
-    // Inter first, egui's built-in fonts (incl. emoji/icons) as fallback
+    fonts.font_data.insert(
+        "lucide".into(),
+        Arc::new(
+            FontData::from_static(include_bytes!("../assets/fonts/lucide-subset.ttf"))
+                .tweak(egui::FontTweak { y_offset_factor: 0.08, ..Default::default() }),
+        ),
+    );
+    // Font chains: Lucide icons, then Inter, then egui's built-ins as fallback
     let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "inter".into());
-    let mut semi = vec!["inter-semibold".to_string()];
+    {
+        let prop = fonts.families.get_mut(&FontFamily::Proportional).unwrap();
+        // Lucide first: it only contains private-use icon codepoints, and Inter has
+        // its own private-use glyphs that would otherwise shadow the icons.
+        prop.insert(0, "lucide".into());
+        prop.insert(1, "inter".into());
+    }
+    fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "lucide".into());
+    let mut semi = vec!["lucide".to_string(), "inter-semibold".to_string()];
     semi.extend(fallback);
     fonts.families.insert(semibold(), semi);
     ctx.set_fonts(fonts);
@@ -196,6 +210,10 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
     style.spacing.interact_size = Vec2::new(40.0, 30.0);
     style.spacing.slider_width = 220.0;
     style.spacing.menu_margin = egui::Margin::same(6);
+    style.spacing.scroll = egui::style::ScrollStyle::floating();
+    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.combo_height = 260.0;
+    style.interaction.tooltip_delay = 0.35;
 
     style.text_styles = [
         (TextStyle::Heading, FontId::new(22.0, semibold())),

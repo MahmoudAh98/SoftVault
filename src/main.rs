@@ -5,11 +5,13 @@ mod app;
 mod crypto;
 mod db;
 mod generator;
+mod icons;
 mod mailer;
 mod protect;
 mod render;
 mod theme;
 mod totp;
+mod transfer;
 mod vault;
 mod widgets;
 

@@ -35,13 +35,24 @@ impl NoteFormat {
         }
     }
 
+    /// Icon used for the item tile in lists.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Plain => crate::icons::STICKY_NOTE,
+            Self::Markdown => crate::icons::FILE_TEXT,
+            Self::Code => crate::icons::CODE,
+            Self::Json => crate::icons::BRACES,
+            Self::Csv => crate::icons::TABLE,
+        }
+    }
+
     pub fn badge(self) -> &'static str {
         match self {
-            Self::Plain => "📝 Note",
-            Self::Markdown => "📝 Markdown",
-            Self::Code => "💻 Code",
-            Self::Json => "{ } JSON",
-            Self::Csv => "▦ CSV",
+            Self::Plain => "\u{E303}  Note",
+            Self::Markdown => "\u{E0CC}  Markdown",
+            Self::Code => "\u{E093}  Code",
+            Self::Json => "\u{E36A}  JSON",
+            Self::Csv => "\u{E17D}  CSV",
         }
     }
 
@@ -244,7 +255,7 @@ impl<'a> Md<'a> {
             ui.horizontal_top(|ui| {
                 ui.add_space(indent);
                 if let Some(m) = &marker {
-                    let col = if m.starts_with('☑') { p.success } else if m.starts_with('☐') { p.weak } else { p.accent };
+                    let col = if m.starts_with('\u{E559}') { p.success } else if m.starts_with('\u{E167}') { p.weak } else { p.accent };
                     ui.add_sized([22.0, 16.0], egui::Label::new(RichText::new(m).color(col).family(semibold())));
                 }
                 ui.vertical(|ui| draw_runs(ui, p, &runs));
@@ -408,7 +419,7 @@ pub fn markdown(ui: &mut Ui, p: &Palette, text: &str) {
                     if let Some((url, alt)) = md.image.take() {
                         // remote images are never loaded (privacy); show a placeholder
                         let label = if alt.is_empty() { "image".to_string() } else { alt };
-                        md.push_text(&format!("🖼 {label}"));
+                        md.push_text(&format!("\u{E0F6} {label}"));
                         let _ = url;
                     }
                 }
@@ -459,7 +470,7 @@ pub fn markdown(ui: &mut Ui, p: &Palette, text: &str) {
                 ui.add_space(4.0);
             }
             Event::TaskListMarker(checked) => {
-                md.marker = Some(if checked { "☑".into() } else { "☐".into() });
+                md.marker = Some(if checked { "\u{E559}".into() } else { "\u{E167}".into() });
                 if checked {
                     md.style.strike = false;
                 }
@@ -545,7 +556,7 @@ pub fn json(ui: &mut Ui, p: &Palette, text: &str) {
                 serde_json::Value::Array(a) => format!("Valid JSON · array with {} items", a.len()),
                 _ => "Valid JSON".into(),
             };
-            ui.label(RichText::new(format!("✔ {summary}")).size(12.5).color(p.success));
+            ui.label(RichText::new(format!("\u{E226} {summary}")).size(12.5).color(p.success));
             Frame::new()
                 .fill(p.bg_alt)
                 .stroke(Stroke::new(1.0, p.border))
@@ -558,7 +569,7 @@ pub fn json(ui: &mut Ui, p: &Palette, text: &str) {
                 });
         }
         Err(e) => {
-            ui.label(RichText::new(format!("⚠ Invalid JSON: {e}")).color(p.danger));
+            ui.label(RichText::new(format!("\u{E193} Invalid JSON: {e}")).color(p.danger));
             code_block(ui, p, text, "json", true);
         }
     }
@@ -633,7 +644,7 @@ pub fn csv_table(ui: &mut Ui, p: &Palette, text: &str) {
         match rec {
             Ok(r) => rows.push(r.iter().map(|s| s.to_string()).collect()),
             Err(e) => {
-                ui.label(RichText::new(format!("⚠ CSV error: {e}")).color(p.danger));
+                ui.label(RichText::new(format!("\u{E193} CSV error: {e}")).color(p.danger));
                 break;
             }
         }

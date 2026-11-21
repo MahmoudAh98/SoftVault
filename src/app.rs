@@ -3,10 +3,12 @@ use crate::generator::{self, GenOptions};
 use crate::mailer;
 use crate::theme::{self, Palette};
 use crate::render::{self, NoteFormat};
+use crate::icons as ic;
 use crate::totp;
 use crate::vault::{self, ItemData, Kind, Recovery, Vault};
 use crate::widgets::{self as w, card};
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Vec2};
+use crate::transfer;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -19,7 +21,7 @@ enum JobResult {
     Unlocked(anyhow::Result<Key>),
     Rewrapped(anyhow::Result<NewVaultMaterial>),
     Exported(anyhow::Result<Vec<u8>>, PathBuf),
-    ImportDecrypted(anyhow::Result<Vec<ItemData>>),
+    ImportDecrypted(anyhow::Result<vault::PlainExport>),
     VerifyMailSent(Result<(), String>),
     HintMailSent(Result<(), String>),
 }
@@ -39,7 +41,44 @@ enum View {
     Notes,
     Favorites,
     Generator,
+    Health,
+    Files,
     Settings,
+}
+
+/// Something being dragged out of the window.
+enum DragSource {
+    Note(String),
+    File(String),
+}
+
+struct Row {
+    id: String,
+    title: String,
+    sub: String,
+    favorite: bool,
+    note: bool,
+    updated: i64,
+    badge: &'static str,
+    note_icon: &'static str,
+}
+
+#[derive(Default)]
+struct Health {
+    logins: usize,
+    weak: Vec<String>,
+    reused: Vec<String>,
+    old: Vec<String>,
+    no_2fa: usize,
+}
+
+impl Health {
+    fn issue_count(&self) -> usize {
+        let mut ids: Vec<&String> = self.weak.iter().chain(&self.reused).collect();
+        ids.sort();
+        ids.dedup();
+        ids.len()
+    }
 }
 
 struct Editor {
@@ -49,6 +88,7 @@ struct Editor {
     show_gen: bool,
     confirm_delete: bool,
     note_mode: NoteMode,
+    opened: Instant,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -83,12 +123,14 @@ struct SettingsUi {
     import_bytes: Option<Vec<u8>>,
     import_pw: Zeroizing<String>,
     loaded: bool,
+    tab: usize,
 }
 
 struct Toast {
     text: String,
     ok: bool,
     until: Instant,
+    born: Instant,
 }
 
 pub struct SoftVaultApp {
@@ -125,6 +167,32 @@ pub struct SoftVaultApp {
     want_focus: bool,
     gen_preview: Zeroizing<String>,
     full: Option<FullView>,
+    sort: (w::SortCol, bool),
+    db_location: vault::DbLocation,
+    deleting: Option<(String, Instant)>,
+    undo: Option<UndoDelete>,
+    view_changed: (View, Instant),
+    temp: transfer::TempArea,
+    drag_out: Option<DragSource>,
+    file_confirm: Option<String>,
+    file_deleting: Option<(String, Instant)>,
+}
+
+const DELETE_ANIM_SECS: f32 = 0.85;
+const UNDO_SECS: u64 = 10;
+
+/// A just-deleted item kept in memory for a few seconds so it can be restored.
+struct UndoDelete {
+    id: String,
+    data: ItemData,
+    title: String,
+    until: Instant,
+}
+
+impl Drop for UndoDelete {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
 }
 
 struct FullView {
@@ -136,8 +204,8 @@ struct FullView {
 
 impl SoftVaultApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let path = vault::default_db_path();
-        let vault = Vault::open(&path).expect("could not open vault database");
+        let location = vault::resolve_db_location();
+        let vault = Vault::open(&location.path).expect("could not open vault database");
         let dark = vault.get_plain("theme").map(|t| t != "light").unwrap_or(true);
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, dark);
@@ -174,11 +242,20 @@ impl SoftVaultApp {
             want_focus: true,
             gen_preview: Default::default(),
             full: None,
+            sort: (w::SortCol::Name, true),
+            db_location: location,
+            deleting: None,
+            undo: None,
+            view_changed: (View::All, Instant::now()),
+            temp: transfer::TempArea::new(),
+            drag_out: None,
+            file_confirm: None,
+            file_deleting: None,
         }
     }
 
     fn toast(&mut self, text: impl Into<String>, ok: bool) {
-        self.toast = Some(Toast { text: text.into(), ok, until: Instant::now() + Duration::from_secs(4) });
+        self.toast = Some(Toast { text: text.into(), ok, until: Instant::now() + Duration::from_secs(4), born: Instant::now() });
     }
 
     fn spawn(&mut self, ctx: &egui::Context, label: Option<&str>, f: impl FnOnce() -> JobResult + Send + 'static) {
@@ -202,6 +279,12 @@ impl SoftVaultApp {
 
     fn lock(&mut self, ctx: &egui::Context) {
         self.close_fullscreen(ctx);
+        self.temp.clear();
+        self.drag_out = None;
+        self.file_confirm = None;
+        self.file_deleting = None;
+        self.undo = None;
+        self.deleting = None;
         self.editor = None;
         self.selected = None;
         self.su = SettingsUi::default();
@@ -288,11 +371,11 @@ impl SoftVaultApp {
                 }
                 JobResult::ImportDecrypted(r) => {
                     self.busy = None;
-                    match r.and_then(|items| self.vault.import_items(items)) {
-                        Ok(n) => {
+                    match r.and_then(|e| self.vault.import_export(e)) {
+                        Ok((n, f)) => {
                             self.su.import_bytes = None;
                             self.su.import_pw.zeroize();
-                            self.toast(format!("Imported {n} entries"), true);
+                            self.toast(format!("Imported {n} items and {f} files"), true);
                         }
                         Err(e) => self.toast(format!("Import failed: {e}"), false),
                     }
@@ -342,10 +425,15 @@ impl SoftVaultApp {
                 self.toast("Locked after inactivity", true);
             }
         }
+        self.temp.sweep();
+        if self.undo.as_ref().is_some_and(|u| Instant::now() > u.until) {
+            self.undo = None;
+        }
         if let Some(t) = &self.toast
-            && Instant::now() > t.until {
-                self.toast = None;
-            }
+            && Instant::now() > t.until
+        {
+            self.toast = None;
+        }
         ctx.request_repaint_after(Duration::from_millis(1000));
     }
 
@@ -372,7 +460,7 @@ impl SoftVaultApp {
                             ui.with_layout(Layout::top_down(Align::Min), |ui| add(self, ui));
                         });
                     ui.add_space(16.0);
-                    ui.label(RichText::new("🔒 Argon2id · XChaCha20-Poly1305 · stored locally in SQLite").size(12.0).color(p.weak));
+                    ui.label(RichText::new("\u{E10B} Argon2id · XChaCha20-Poly1305 · stored locally in SQLite").size(12.0).color(p.weak));
                     ui.add_space(16.0);
                 });
             });
@@ -381,7 +469,7 @@ impl SoftVaultApp {
 
     fn error_line(&self, ui: &mut egui::Ui, p: &Palette) {
         if let Some(e) = &self.error {
-            ui.label(RichText::new(format!("⚠ {e}")).color(p.danger).size(13.0));
+            ui.label(RichText::new(format!("\u{E193} {e}")).color(p.danger).size(13.0));
         }
     }
 
@@ -391,12 +479,16 @@ impl SoftVaultApp {
             ui.label(RichText::new("Your master password is never stored or sent anywhere. If you forget it, your data cannot be recovered.").size(12.5).color(p.weak));
             ui.add_space(8.0);
             w::label(ui, p, "Master password (required)");
-            w::text_input(ui, &mut s.pw, "At least 12 characters", !s.show_pw);
+            w::row_rtl(ui, |ui| {
+                if w::icon_btn(ui, p, if s.show_pw { ic::EYE_OFF } else { ic::EYE }, "Show / hide").clicked() {
+                    s.show_pw = !s.show_pw;
+                }
+                ui.add_sized([ui.available_width(), 36.0], egui::TextEdit::singleline(&mut *s.pw).password(!s.show_pw).hint_text("At least 12 characters").margin(Margin::symmetric(12, 9)));
+            });
             let (sc, lb, bits) = generator::strength(&s.pw);
             w::strength_bar(ui, p, sc, lb, bits);
             w::label(ui, p, "Confirm master password (required)");
             let r = w::text_input(ui, &mut s.pw2, "Repeat master password", !s.show_pw);
-            ui.checkbox(&mut s.show_pw, "Show password");
             w::label(ui, p, "Master password hint");
             w::text_input(ui, &mut s.hint_input, "Something only you understand", false);
             ui.label(RichText::new("The hint is never shown on screen. It can only be emailed to a verified Gmail you add later in Settings.").size(11.5).color(p.weak));
@@ -443,12 +535,16 @@ impl SoftVaultApp {
             ui.vertical_centered(|ui| ui.label(RichText::new("Verify your identity to continue.").size(13.5).color(p.weak)));
             ui.add_space(8.0);
             w::label(ui, p, "Master password (required)");
-            let r = w::text_input(ui, &mut s.pw, "Master password", !s.show_pw);
+            let r = w::row_rtl(ui, |ui| {
+                if w::icon_btn(ui, p, if s.show_pw { ic::EYE_OFF } else { ic::EYE }, "Show / hide").clicked() {
+                    s.show_pw = !s.show_pw;
+                }
+                ui.add_sized([ui.available_width(), 36.0], egui::TextEdit::singleline(&mut *s.pw).password(!s.show_pw).hint_text("Master password").margin(Margin::symmetric(12, 9)))
+            });
             if s.want_focus {
                 s.want_focus = false;
                 r.request_focus();
             }
-            ui.checkbox(&mut s.show_pw, "Show password");
             s.error_line(ui, p);
             let locked_out = s.lockout_until.map(|t| Instant::now() < t).unwrap_or(false);
             if let Some(b) = &s.busy {
@@ -478,7 +574,7 @@ impl SoftVaultApp {
                         });
                     } else if wait > 0 {
                         ui.label(RichText::new(format!("Hint sent. You can resend in {wait}s.")).color(p.weak).size(12.5));
-                    } else if w::ghost_wide(ui, p, &format!("📧  Email my hint to {}", mailer::mask_email(&rec.email))).clicked() {
+                    } else if w::ghost_wide(ui, p, &format!("\u{E10F}  Email my hint to {}", mailer::mask_email(&rec.email))).clicked() {
                         let rec = rec.clone();
                         let hint = s.vault.hint().unwrap();
                         s.mail_busy = true;
@@ -574,12 +670,28 @@ impl SoftVaultApp {
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(p.bg).inner_margin(Margin::symmetric(32, 24)))
-            .show(ui, |ui| match self.view {
-                View::Settings => self.ui_settings(ui, p),
-                View::Generator => self.ui_generator(ui, p),
-                _ => self.ui_vault_page(ui, p),
+            .show(ui, |ui| {
+                // gentle fade + rise when switching pages
+                if self.view_changed.0 != self.view {
+                    self.view_changed = (self.view, Instant::now());
+                }
+                let t = (self.view_changed.1.elapsed().as_secs_f32() / 0.2).min(1.0);
+                let ease = 1.0 - (1.0 - t).powi(3);
+                if t < 1.0 {
+                    ui.ctx().request_repaint();
+                }
+                ui.multiply_opacity(ease);
+                ui.add_space((1.0 - ease) * 10.0);
+                match self.view {
+                    View::Settings => self.ui_settings(ui, p),
+                    View::Generator => self.ui_generator(ui, p),
+                    View::Health => self.ui_health(ui, p),
+                    View::Files => self.ui_files(ui, p),
+                    _ => self.ui_vault_page(ui, p),
+                }
             });
 
+        self.shortcuts(&ctx);
         if self.editor.is_some() {
             self.ui_editor_modal(&ctx, p);
         }
@@ -591,37 +703,51 @@ impl SoftVaultApp {
     fn ui_nav(&mut self, ui: &mut egui::Ui, p: &Palette) {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
-            w::logo(ui, p, 30.0, true);
-            ui.label(w::h("SoftVault", 19.0).color(p.nav_text));
+            w::logo(ui, p, 32.0, true);
+            ui.add_space(2.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(w::h("SoftVault", 17.0).color(p.nav_text));
+                ui.label(RichText::new("Password Manager").size(11.5).color(p.nav_weak));
+            });
         });
-        ui.add_space(16.0);
-        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.add_space(18.0);
+        ui.spacing_mut().item_spacing.y = 3.0;
         let n_pw = self.vault.items.iter().filter(|i| i.data.kind == Kind::Password).count();
         let n_notes = self.vault.items.iter().filter(|i| i.data.kind == Kind::Note).count();
         let n_fav = self.vault.items.iter().filter(|i| i.data.favorite).count();
         w::nav_section(ui, p, "VAULT");
         for (v, icon, text, count) in [
-            (View::All, "🗂", "All items", self.vault.items.len()),
-            (View::Passwords, "🔑", "Logins", n_pw),
-            (View::Notes, "📝", "Secure notes", n_notes),
-            (View::Favorites, "★", "Favorites", n_fav),
+            (View::All, ic::LAYERS, "All items", self.vault.items.len()),
+            (View::Passwords, ic::KEY_ROUND, "Logins", n_pw),
+            (View::Notes, ic::STICKY_NOTE, "Secure notes", n_notes),
+            (View::Favorites, ic::STAR, "Favorites", n_fav),
+            (View::Files, ic::FOLDER_LOCK, "Secure files", self.vault.files.len()),
         ] {
             if w::nav_item(ui, p, icon, text, self.view == v, Some(count)).clicked() {
                 self.view = v;
             }
         }
         w::nav_section(ui, p, "TOOLS");
-        if w::nav_item(ui, p, "🎲", "Generator", self.view == View::Generator, None).clicked() {
+        if w::nav_item(ui, p, ic::DICES, "Generator", self.view == View::Generator, None).clicked() {
             self.view = View::Generator;
         }
-        w::nav_section(ui, p, "MANAGE");
-        if w::nav_item(ui, p, "⇅", "Import / export", false, None).clicked() {
-            self.view = View::Settings;
-            self.su.loaded = false;
+        let issues = self.health().issue_count();
+        if w::nav_item(ui, p, ic::SHIELD_CHECK, "Vault health", self.view == View::Health, (issues > 0).then_some(issues)).clicked() {
+            self.view = View::Health;
         }
-        if w::nav_item(ui, p, "⚙", "Settings", self.view == View::Settings, None).clicked() {
+        w::nav_section(ui, p, "MANAGE");
+        if w::nav_item(ui, p, ic::ARROW_DOWN_UP, "Import & export", self.view == View::Settings && self.su.tab == 3, None).clicked() {
             self.view = View::Settings;
             self.su.loaded = false;
+            self.su.tab = 3;
+        }
+        if w::nav_item(ui, p, ic::SETTINGS, "Settings", self.view == View::Settings && self.su.tab != 3, None).clicked() {
+            self.view = View::Settings;
+            self.su.loaded = false;
+            if self.su.tab == 3 {
+                self.su.tab = 0;
+            }
         }
 
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
@@ -629,49 +755,52 @@ impl SoftVaultApp {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::hover());
                 ui.painter().circle_filled(r.center(), 17.0, if p.dark { p.accent } else { Color32::from_rgb(0x17, 0x5d, 0xdc) });
-                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "SV", egui::FontId::new(12.5, theme::semibold()), if p.dark { p.on_accent } else { Color32::WHITE });
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, ic::USER, egui::FontId::proportional(16.0), if p.dark { p.on_accent } else { Color32::WHITE });
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(w::h("Local vault", 13.5).color(p.nav_text));
-                    let mfa = if self.vault.settings.mfa_secret.is_some() { "2FA enabled" } else { "2FA off" };
-                    ui.label(RichText::new(mfa).size(12.0).color(p.nav_weak));
+                    let mins = self.vault.settings.auto_lock_minutes.max(1) as u64 * 60;
+                    let left = mins.saturating_sub(self.last_activity.elapsed().as_secs());
+                    ui.label(RichText::new(format!("{}  Locks in {}:{:02}", ic::TIMER, left / 60, left % 60)).size(11.5).color(p.nav_weak));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new("🔒").size(15.0).color(p.nav_text)).fill(p.nav_hover).stroke(Stroke::NONE).corner_radius(theme::PILL).min_size(Vec2::splat(34.0)))
-                        .on_hover_text("Lock vault")
+                        .add(egui::Button::new(RichText::new(ic::LOCK).size(15.0).color(p.nav_text)).fill(p.nav_hover).stroke(Stroke::NONE).corner_radius(theme::PILL).min_size(Vec2::splat(34.0)))
+                        .on_hover_text("Lock now (Ctrl+L)")
                         .clicked()
                     {
                         self.lock(ui.ctx());
                     }
                 });
             });
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             let (line, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
             ui.painter().rect_filled(line, CornerRadius::ZERO, p.nav_hover);
-            ui.add_space(8.0);
-            // theme switch
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let half = (ui.available_width() - 6.0) / 2.0;
-                for (dark, txt) in [(false, "☀ Light"), (true, "🌙 Dark")] {
-                    let sel = self.dark == dark;
-                    let b = egui::Button::new((egui::Atom::grow(), RichText::new(txt).size(13.0).color(if sel { p.nav_active_text } else { p.nav_text }), egui::Atom::grow()))
-                        .fill(if sel { p.nav_active } else { p.nav_hover })
-                        .stroke(Stroke::NONE)
-                        .corner_radius(theme::PILL)
-                        .min_size(Vec2::new(half, 30.0));
-                    if ui.add(b).clicked() {
-                        self.set_theme(dark);
+            ui.add_space(10.0);
+            // segmented theme switch
+            Frame::new().fill(p.nav_hover).corner_radius(theme::PILL).inner_margin(Margin::same(3)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let half = (ui.available_width()) / 2.0;
+                    for (dark, icon, txt) in [(false, ic::SUN, "Light"), (true, ic::MOON, "Dark")] {
+                        let sel = self.dark == dark;
+                        let b = egui::Button::new((egui::Atom::grow(), RichText::new(format!("{icon}  {txt}")).size(13.0).color(if sel { p.nav_active_text } else { p.nav_weak }), egui::Atom::grow()))
+                            .fill(if sel { p.nav_active } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::NONE)
+                            .corner_radius(theme::PILL)
+                            .min_size(Vec2::new(half, 28.0));
+                        if ui.add(b).clicked() {
+                            self.set_theme(dark);
+                        }
                     }
-                }
+                });
             });
         });
     }
 
-    fn visible_items(&self) -> Vec<(String, String, String, bool, bool, i64, &'static str)> {
+    fn visible_items(&self) -> Vec<Row> {
         let q = self.search.to_lowercase();
-        let mut v: Vec<_> = self
+        let mut v: Vec<Row> = self
             .vault
             .items
             .iter()
@@ -689,26 +818,46 @@ impl SoftVaultApp {
                     || (i.data.kind == Kind::Note && i.data.notes.to_lowercase().contains(&q))
             })
             .map(|i| {
-                let sub = match i.data.kind {
-                    Kind::Password => {
-                        if !i.data.username.is_empty() { i.data.username.clone() } else { i.data.url.clone() }
-                    }
-                    Kind::Note => match i.data.format {
+                let note = i.data.kind == Kind::Note;
+                let sub = if note {
+                    match i.data.format {
                         NoteFormat::Csv => format!("{} rows", i.data.notes.lines().count().saturating_sub(1)),
                         NoteFormat::Code if !i.data.lang.is_empty() => format!("{} · {} lines", i.data.lang, i.data.notes.lines().count()),
-                        _ => i.data
+                        _ => i
+                            .data
                             .notes
                             .lines()
                             .map(|l| l.trim_start_matches(['#', '>', '-', '*', ' ', '`', '{', '[']).trim())
                             .find(|l| !l.is_empty())
                             .unwrap_or("")
                             .to_string(),
-                    },
+                    }
+                } else if !i.data.username.is_empty() {
+                    i.data.username.clone()
+                } else {
+                    i.data.url.clone()
                 };
-                (i.id.clone(), i.data.title.clone(), sub, i.data.favorite, i.data.kind == Kind::Note, i.data.updated, if i.data.kind == Kind::Note { i.data.format.badge() } else { "🔑 Login" })
+                Row {
+                    id: i.id.clone(),
+                    title: i.data.title.clone(),
+                    sub,
+                    favorite: i.data.favorite,
+                    note,
+                    updated: i.data.updated,
+                    badge: if note { i.data.format.badge() } else { "\u{E4A3}  Login" },
+                    note_icon: i.data.format.icon(),
+                }
             })
             .collect();
-        v.sort_by(|a, b| b.3.cmp(&a.3).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+        let (col, asc) = self.sort;
+        v.sort_by(|a, b| {
+            let o = match col {
+                w::SortCol::Name => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                w::SortCol::Type => a.badge.cmp(b.badge).then(a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+                w::SortCol::Updated => a.updated.cmp(&b.updated),
+            };
+            if asc { o } else { o.reverse() }
+        });
         v
     }
 
@@ -721,6 +870,7 @@ impl SoftVaultApp {
             show_gen: false,
             confirm_delete: false,
             note_mode: if kind == Kind::Note { NoteMode::Split } else { NoteMode::Edit },
+            opened: Instant::now(),
         });
         if kind == Kind::Password
             && let Some(e) = &mut self.editor
@@ -732,65 +882,114 @@ impl SoftVaultApp {
     fn select(&mut self, id: &str) {
         if let Some(it) = self.vault.items.iter().find(|i| i.id == id) {
             self.selected = Some(id.to_string());
-            self.editor = Some(Editor { id: Some(id.to_string()), data: it.data.clone(), show_pw: false, show_gen: false, confirm_delete: false, note_mode: NoteMode::Preview });
+            self.editor = Some(Editor { id: Some(id.to_string()), data: it.data.clone(), show_pw: false, show_gen: false, confirm_delete: false, note_mode: NoteMode::Preview, opened: Instant::now() });
         }
     }
 
     fn new_item_menu(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        let r = w::primary(ui, p, "＋  New");
+        let r = w::primary(ui, p, &format!("{}  New", ic::PLUS));
         egui::Popup::menu(&r).show(|ui| {
-            ui.set_min_width(190.0);
-            if ui.button("🔑   Login").clicked() {
+            ui.set_min_width(220.0);
+            ui.spacing_mut().button_padding = Vec2::new(10.0, 8.0);
+            if ui.button(format!("{}   Login            Ctrl+N", ic::KEY_ROUND)).clicked() {
                 self.new_item(Kind::Password);
                 ui.close();
             }
-            if ui.button("📝   Secure note").clicked() {
+            if ui.button(format!("{}   Secure note   Ctrl+Shift+N", ic::STICKY_NOTE)).clicked() {
                 self.new_item(Kind::Note);
                 ui.close();
             }
         });
     }
 
+    fn search_id() -> egui::Id {
+        egui::Id::unique("softvault-search")
+    }
+
+    /// Global keyboard shortcuts while the vault is open.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.editor.is_some() || self.full.is_some() {
+            return;
+        }
+        let (f, n, sn, l) = ctx.input(|i| {
+            let c = i.modifiers.command;
+            (
+                c && i.key_pressed(egui::Key::F),
+                c && !i.modifiers.shift && i.key_pressed(egui::Key::N),
+                c && i.modifiers.shift && i.key_pressed(egui::Key::N),
+                c && i.key_pressed(egui::Key::L),
+            )
+        });
+        if f {
+            if !matches!(self.view, View::All | View::Passwords | View::Notes | View::Favorites) {
+                self.view = View::All;
+            }
+            ctx.memory_mut(|m| m.request_focus(Self::search_id()));
+        }
+        if n {
+            self.new_item(Kind::Password);
+        }
+        if sn {
+            self.new_item(Kind::Note);
+        }
+        if l {
+            self.lock(ctx);
+        }
+    }
+
     fn ui_vault_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
-        let title = match self.view {
-            View::Passwords => "Logins",
-            View::Notes => "Secure notes",
-            View::Favorites => "Favorites",
-            _ => "All items",
+        let (title, icon) = match self.view {
+            View::Passwords => ("Logins", ic::KEY_ROUND),
+            View::Notes => ("Secure notes", ic::STICKY_NOTE),
+            View::Favorites => ("Favorites", ic::STAR),
+            _ => ("All items", ic::LAYERS),
         };
-        w::page_header(ui, p, "🗂", title);
-        ui.add_space(14.0);
-
-        // toolbar: search (left) · import + new (right)
-        w::row_rtl(ui, |ui| {
-            self.new_item_menu(ui, p);
-            if w::ghost(ui, p, "⇅  Import").clicked() {
-                self.view = View::Settings;
-                self.su.loaded = false;
-            }
-            ui.add_space((ui.available_width() - 380.0).max(0.0));
-            ui.add_sized(
-                [ui.available_width(), 36.0],
-                egui::TextEdit::singleline(&mut self.search).hint_text("🔍  Search vault").margin(Margin::symmetric(12, 9)),
-            );
-        });
-        ui.add_space(6.0);
-
         let items = self.visible_items();
-        // filter chips + count
+        let subtitle = format!(
+            "{} item{} · end-to-end encrypted",
+            items.len(),
+            if items.len() == 1 { "" } else { "s" }
+        );
+        ui.horizontal(|ui| {
+            w::page_header(ui, p, icon, title, &subtitle);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.new_item_menu(ui, p);
+                if w::ghost(ui, p, &format!("{}  Import", ic::UPLOAD)).clicked() {
+                    self.view = View::Settings;
+                    self.su.loaded = false;
+                    self.su.tab = 3;
+                }
+            });
+        });
+        ui.add_space(16.0);
+
+        // toolbar: search + filter chips
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            for (v, label) in [(View::All, "Type: All"), (View::Passwords, "🔑 Logins"), (View::Notes, "📝 Notes"), (View::Favorites, "★ Favorites")] {
-                if w::chip(ui, p, label, self.view == v).clicked() {
+            ui.add_sized(
+                [340.0, 36.0],
+                egui::TextEdit::singleline(&mut self.search)
+                    .id(Self::search_id())
+                    .hint_text(format!("{}   Search vault        Ctrl+F", ic::SEARCH))
+                    .margin(Margin::symmetric(12, 9)),
+            );
+            if !self.search.is_empty() && w::ghost_icon(ui, p, ic::X, "Clear search").clicked() {
+                self.search.clear();
+            }
+            ui.add_space(8.0);
+            for (v, label) in [
+                (View::All, format!("{}  All", ic::LAYERS)),
+                (View::Passwords, format!("{}  Logins", ic::KEY_ROUND)),
+                (View::Notes, format!("{}  Notes", ic::STICKY_NOTE)),
+                (View::Favorites, format!("{}  Favorites", ic::STAR)),
+            ] {
+                if w::chip(ui, p, &label, self.view == v).clicked() {
                     self.view = v;
                 }
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} item{}", items.len(), if items.len() == 1 { "" } else { "s" })).size(12.5).color(p.weak));
-            });
         });
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
         let fmt = |t: i64| {
             chrono::DateTime::from_timestamp(t, 0)
@@ -801,69 +1000,111 @@ impl SoftVaultApp {
             .fill(p.card)
             .stroke(Stroke::new(1.0, p.border))
             .corner_radius(theme::R_CARD)
-            .inner_margin(Margin::symmetric(4, 2))
+            .inner_margin(Margin::symmetric(6, 2))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                w::table_header(ui, p);
+                if let Some(col) = w::table_header(ui, p, self.sort) {
+                    self.sort = if self.sort.0 == col { (col, !self.sort.1) } else { (col, col != w::SortCol::Updated) };
+                }
                 ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     if items.is_empty() {
-                        ui.add_space(48.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("🔍").size(30.0).color(p.weak));
-                            ui.add_space(4.0);
-                            ui.label(w::h(if self.search.is_empty() { "No items to list" } else { "No matching items" }, 16.0));
-                            ui.label(RichText::new("Items you add are encrypted on this device before they're saved.").color(p.weak));
-                            ui.add_space(8.0);
-                            if self.search.is_empty() && w::primary(ui, p, "＋  New login").clicked() {
-                                self.new_item(Kind::Password);
-                            }
-                        });
+                        ui.add_space(64.0);
+                        if self.search.is_empty() {
+                            w::empty_state(ui, p, ic::VAULT, "No items yet", "Add a login or a secure note. Everything is encrypted on this device.");
+                            ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
+                                    let wdt = 290.0;
+                                    ui.add_space((ui.available_width() - wdt) / 2.0);
+                                    if w::primary(ui, p, &format!("{}  New login", ic::KEY_ROUND)).clicked() {
+                                        self.new_item(Kind::Password);
+                                    }
+                                    if w::ghost(ui, p, &format!("{}  New note", ic::STICKY_NOTE)).clicked() {
+                                        self.new_item(Kind::Note);
+                                    }
+                                });
+                            });
+                        } else {
+                            w::empty_state(ui, p, ic::SEARCH, "No matching items", "Try a different search or filter.");
+                        }
                     }
-                    for (id, title, sub, fav, note, updated, badge) in items {
+                    for row in items {
+                        let id = row.id.clone();
                         let sel = self.selected.as_deref() == Some(&id);
-                        let (resp, opt_rect) = w::table_row(ui, p, &title, &sub, note, badge, fav, &fmt(updated), sel);
+                        let (resp, opt_rect) = w::table_row(ui, p, &row.title, &row.sub, row.note, row.note_icon, row.badge, row.favorite, &fmt(row.updated), sel);
+                        let hovered = ui.rect_contains_pointer(resp.rect);
+                        if row.note && resp.drag_started() {
+                            self.drag_out = Some(DragSource::Note(id.clone()));
+                        }
+
+                        // hover quick actions, just left of the ⋮ button
+                        if hovered {
+                            let qa = egui::Rect::from_min_max(egui::pos2(opt_rect.left() - 150.0, opt_rect.top()), egui::pos2(opt_rect.left() - 4.0, opt_rect.bottom()));
+                            let mut q = ui.new_child(egui::UiBuilder::new().max_rect(qa).layout(Layout::right_to_left(Align::Center)));
+                            q.spacing_mut().item_spacing.x = 2.0;
+                            let data = self.vault.items.iter().find(|i| i.id == id).map(|i| (i.data.kind, i.data.username.clone(), i.data.password.clone(), i.data.url.clone()));
+                            if let Some((kind, user, pw, url)) = data {
+                                if kind == Kind::Password {
+                                    if !url.is_empty() && w::ghost_icon(&mut q, p, ic::EXTERNAL_LINK, "Open website").clicked() {
+                                        let u = if url.contains("://") { url.clone() } else { format!("https://{url}") };
+                                        if u.starts_with("https://") || u.starts_with("http://") {
+                                            ctx.open_url(egui::OpenUrl::new_tab(u));
+                                        }
+                                    }
+                                    if w::ghost_icon(&mut q, p, ic::KEY_ROUND, "Copy password").clicked() {
+                                        self.copy(&ctx, &pw, "Password");
+                                    }
+                                    if !user.is_empty() && w::ghost_icon(&mut q, p, ic::USER, "Copy username").clicked() {
+                                        self.copy(&ctx, &user, "Username");
+                                    }
+                                } else if w::ghost_icon(&mut q, p, ic::MAXIMIZE_2, "Open full screen").clicked() {
+                                    self.open_fullscreen(Some(id.clone()));
+                                }
+                            }
+                        }
+
                         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(opt_rect).layout(Layout::left_to_right(Align::Center)));
-                        let ob = child.add(
-                            egui::Button::new(RichText::new("⋮").size(16.0).color(p.weak))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE)
-                                .corner_radius(theme::PILL)
-                                .min_size(Vec2::splat(30.0)),
-                        );
+                        let ob = w::ghost_icon(&mut child, p, ic::ELLIPSIS_VERTICAL, "More options");
                         let menu = |ui: &mut egui::Ui, s: &mut Self| {
-                            ui.set_min_width(200.0);
+                            ui.set_min_width(210.0);
+                            ui.spacing_mut().button_padding = Vec2::new(10.0, 7.0);
                             let data = s.vault.items.iter().find(|i| i.id == id).map(|i| i.data.clone());
                             let Some(data) = data else { return };
                             if data.kind == Kind::Password {
-                                if ui.button("📋   Copy username").clicked() {
+                                if ui.button(format!("{}   Copy username", ic::USER)).clicked() {
                                     s.copy(&ctx, &data.username, "Username");
                                     ui.close();
                                 }
-                                if ui.button("📋   Copy password").clicked() {
+                                if ui.button(format!("{}   Copy password", ic::KEY_ROUND)).clicked() {
                                     s.copy(&ctx, &data.password, "Password");
                                     ui.close();
                                 }
-                            } else if ui.button("📋   Copy note").clicked() {
-                                s.copy(&ctx, &data.notes, "Note");
-                                ui.close();
+                            } else {
+                                if ui.button(format!("{}   Copy note", ic::COPY)).clicked() {
+                                    s.copy(&ctx, &data.notes, "Note");
+                                    ui.close();
+                                }
+                                if ui.button(format!("{}   Open full screen", ic::MAXIMIZE_2)).clicked() {
+                                    s.open_fullscreen(Some(id.clone()));
+                                    ui.close();
+                                }
+                                if ui.button(format!("{}   Save decrypted copy…", ic::DOWNLOAD)).clicked() {
+                                    ui.close();
+                                    s.save_decrypted(DragSource::Note(id.clone()));
+                                }
                             }
-                            if data.kind == Kind::Note && ui.button("⛶   Open full screen").clicked() {
-                                s.open_fullscreen(Some(id.clone()));
-                                ui.close();
-                            }
-                            if ui.button("✏   Edit").clicked() {
+                            if ui.button(format!("{}   Edit", ic::PENCIL)).clicked() {
                                 s.select(&id);
                                 ui.close();
                             }
-                            if ui.button(if data.favorite { "☆   Remove favorite" } else { "★   Add to favorites" }).clicked() {
+                            if ui.button(format!("{}   {}", ic::STAR, if data.favorite { "Remove from favorites" } else { "Add to favorites" })).clicked() {
                                 let mut d = data.clone();
                                 d.favorite = !d.favorite;
                                 let _ = s.vault.save_item(Some(id.clone()), d);
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button(RichText::new("🗑   Delete").color(p.danger)).clicked() {
+                            if ui.button(RichText::new(format!("{}   Delete", ic::TRASH_2)).color(p.danger)).clicked() {
                                 s.select(&id);
                                 if let Some(e) = &mut s.editor {
                                     e.confirm_delete = true;
@@ -881,9 +1122,397 @@ impl SoftVaultApp {
             });
     }
 
+    // ─────────────────────────── secure files & drag-and-drop ───────────────────────────
+
+    fn file_icon(name: &str) -> (&'static str, fn(&Palette) -> Color32) {
+        let ext = std::path::Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "heic" => (ic::FILE_IMAGE, |p| p.success),
+            "zip" | "7z" | "rar" | "tar" | "gz" | "xz" | "bz2" => (ic::FILE_ARCHIVE, |p| p.warn),
+            "pdf" | "doc" | "docx" | "odt" | "rtf" => (ic::FILE_TEXT, |p| p.danger),
+            "xls" | "xlsx" | "ods" => (ic::FILE_SPREADSHEET, |p| p.success),
+            "mp3" | "wav" | "flac" | "ogg" | "m4a" => (ic::MUSIC, |p| p.accent),
+            "mp4" | "mkv" | "mov" | "avi" | "webm" => (ic::VIDEO, |p| p.accent),
+            "key" | "pem" | "pfx" | "p12" | "kdbx" | "asc" | "gpg" => (ic::FILE_KEY, |p| p.warn),
+            "exe" | "msi" | "dll" | "bin" | "iso" => (ic::HARD_DRIVE, |p| p.weak),
+            _ => (ic::FILE, |p| p.accent),
+        }
+    }
+
+    /// Encrypt dropped/picked files into the vault.
+    fn import_paths(&mut self, paths: Vec<PathBuf>) {
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| !self.temp.contains(p)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let files = transfer::collect_paths(&paths, 500);
+        let (mut notes, mut stored, mut shredded) = (0usize, 0usize, 0usize);
+        let mut errors: Vec<String> = Vec::new();
+        for path in files {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+            if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > vault::MAX_FILE_BYTES {
+                errors.push(format!("{name}: larger than {} MB", vault::MAX_FILE_BYTES / 1024 / 1024));
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => Zeroizing::new(b),
+                Err(e) => {
+                    errors.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            let as_note = if self.vault.settings.import_text_as_notes {
+                match transfer::classify(&path) {
+                    transfer::Classified::Note { format, lang } => transfer::note_from_file(&path, &bytes, format, lang),
+                    transfer::Classified::File => None,
+                }
+            } else {
+                None
+            };
+            let result = match as_note {
+                Some(note) => self.vault.save_item(None, note).map(|_| notes += 1),
+                None => self.vault.add_file(&name, &bytes, None).map(|_| stored += 1),
+            };
+            match result {
+                Ok(()) => {
+                    if self.vault.settings.move_originals && transfer::shred(&path).is_ok() {
+                        shredded += 1;
+                    }
+                }
+                Err(e) => errors.push(format!("{name}: {e}")),
+            }
+        }
+        let mut parts = Vec::new();
+        if stored > 0 {
+            parts.push(format!("{stored} file{}", if stored == 1 { "" } else { "s" }));
+        }
+        if notes > 0 {
+            parts.push(format!("{notes} note{}", if notes == 1 { "" } else { "s" }));
+        }
+        if !parts.is_empty() {
+            let moved = if shredded > 0 { format!(" · {shredded} original{} securely deleted", if shredded == 1 { "" } else { "s" }) } else { String::new() };
+            self.toast(format!("Encrypted {} into your vault{moved}", parts.join(" and ")), true);
+        }
+        if !errors.is_empty() {
+            self.toast(format!("Couldn't import: {}", errors.join("; ")), false);
+        }
+    }
+
+    /// Runs after the UI with access to the native window (needed for OS drag & drop).
+    fn process_drag_out(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        let Some(src) = self.drag_out.take() else { return };
+        if !transfer::DRAG_OUT_SUPPORTED {
+            self.toast("Dragging out of the app is available on Windows. Use “Save decrypted…” instead.", false);
+            return;
+        }
+        let payload: anyhow::Result<(String, Zeroizing<Vec<u8>>)> = match &src {
+            DragSource::Note(id) => self
+                .vault
+                .items
+                .iter()
+                .find(|i| &i.id == id)
+                .map(|i| (transfer::note_file_name(&i.data), Zeroizing::new(i.data.notes.as_bytes().to_vec())))
+                .ok_or_else(|| anyhow::anyhow!("note not found")),
+            DragSource::File(id) => match self.vault.files.iter().find(|f| &f.id == id).map(|f| f.meta.name.clone()) {
+                Some(name) => self.vault.read_file(id).map(|b| (name, b)),
+                None => Err(anyhow::anyhow!("file not found")),
+            },
+        };
+        let (name, bytes) = match payload {
+            Ok(v) => v,
+            Err(e) => {
+                self.toast(e.to_string(), false);
+                return;
+            }
+        };
+        let path = match self.temp.write(&name, &bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(format!("Couldn't prepare the file: {e}"), false);
+                return;
+            }
+        };
+        match transfer::start_drag_out(frame, vec![path]) {
+            Ok(true) => self.toast(format!("Decrypted copy of “{name}” saved"), true),
+            Ok(false) => {}
+            Err(e) => self.toast(e, false),
+        }
+        ctx.stop_dragging();
+        self.last_activity = Instant::now();
+    }
+
+    fn save_decrypted(&mut self, src: DragSource) {
+        let payload = match &src {
+            DragSource::Note(id) => self.vault.items.iter().find(|i| &i.id == id).map(|i| Ok((transfer::note_file_name(&i.data), Zeroizing::new(i.data.notes.as_bytes().to_vec())))),
+            DragSource::File(id) => self.vault.files.iter().find(|f| &f.id == id).map(|f| f.meta.name.clone()).map(|n| self.vault.read_file(id).map(|b| (n, b))),
+        };
+        match payload {
+            Some(Ok((name, bytes))) => {
+                if let Some(path) = rfd::FileDialog::new().set_file_name(&name).save_file() {
+                    match std::fs::write(&path, &*bytes) {
+                        Ok(()) => self.toast(format!("Decrypted copy saved to {}", path.display()), true),
+                        Err(e) => self.toast(format!("Save failed: {e}"), false),
+                    }
+                }
+            }
+            Some(Err(e)) => self.toast(e.to_string(), false),
+            None => {}
+        }
+    }
+
+    fn ui_files(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let total: u64 = self.vault.files.iter().map(|f| f.meta.size).sum();
+        let n = self.vault.files.len();
+        ui.horizontal(|ui| {
+            w::page_header(ui, p, ic::FOLDER_LOCK, "Secure files", &format!("{n} file{} · {} encrypted", if n == 1 { "" } else { "s" }, transfer::human_size(total)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::primary(ui, p, &format!("{}  Add files", ic::PLUS)).clicked()
+                    && let Some(paths) = rfd::FileDialog::new().pick_files()
+                {
+                    self.import_paths(paths);
+                }
+            });
+        });
+        ui.add_space(16.0);
+
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // ── drop zone
+            let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+            let ht = ui.ctx().animate_bool_with_time(egui::Id::unique("softvault-dropzone"), hovering, 0.2);
+            let (zone, zresp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 168.0), egui::Sense::click());
+            let zhover = zresp.hovered();
+            let painter = ui.painter();
+            painter.rect_filled(zone, theme::R_CARD, w::lerp(if zhover { p.card_hover } else { p.card }, p.accent_soft, ht));
+            let time = ui.ctx().input(|i| i.time) as f32;
+            let offset = if hovering { time * 30.0 } else { 0.0 };
+            w::dashed_rounded_rect(painter, zone.shrink(1.0), 12.0, Stroke::new(1.6, w::lerp(p.border_strong.gamma_multiply(0.6), p.accent, ht.max(if zhover { 0.5 } else { 0.0 }))), offset);
+            if hovering {
+                ui.ctx().request_repaint();
+            }
+            let c = zone.center() - Vec2::new(0.0, 26.0);
+            let bob = (time * 4.0).sin() * 3.0 * ht;
+            painter.circle_filled(c + Vec2::new(0.0, bob), 26.0, p.accent_soft);
+            painter.text(c + Vec2::new(0.0, bob), egui::Align2::CENTER_CENTER, ic::FILE_UP, egui::FontId::proportional(24.0), p.accent);
+            painter.text(zone.center() + Vec2::new(0.0, 16.0), egui::Align2::CENTER_CENTER, if hovering { "Release to encrypt" } else { "Drag files or folders here to encrypt them" }, egui::FontId::new(15.5, theme::semibold()), p.text);
+            painter.text(
+                zone.center() + Vec2::new(0.0, 40.0),
+                egui::Align2::CENTER_CENTER,
+                "or click to browse  ·  drag any card back out to get a decrypted copy",
+                egui::FontId::proportional(12.5),
+                p.weak,
+            );
+            if zresp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                && let Some(paths) = rfd::FileDialog::new().pick_files()
+            {
+                self.import_paths(paths);
+            }
+            ui.add_space(10.0);
+
+            // ── options
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                changed |= w::toggle(ui, p, &mut self.vault.settings.import_text_as_notes).changed();
+                ui.label(RichText::new("Turn text files (.md .txt .json .csv, code) into secure notes").size(13.0));
+                ui.add_space(18.0);
+                changed |= w::toggle(ui, p, &mut self.vault.settings.move_originals).changed();
+                ui.label(RichText::new("Move: securely delete the originals after encrypting").size(13.0));
+            });
+            if changed {
+                let _ = self.vault.save_settings();
+            }
+            ui.add_space(14.0);
+
+            // ── grid of encrypted files
+            if self.vault.files.is_empty() {
+                ui.add_space(30.0);
+                w::empty_state(ui, p, ic::FOLDER_LOCK, "No files yet", "Anything you drop above is encrypted with your vault key before it's saved.");
+                return;
+            }
+            let mut files = self.vault.files.clone();
+            files.sort_by_key(|f| std::cmp::Reverse(f.meta.created));
+            let gap = 14.0;
+            let avail = ui.available_width();
+            let cols = ((avail + gap) / (220.0 + gap)).floor().max(1.0) as usize;
+            let card_w = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
+            let card = Vec2::new(card_w, 176.0);
+            for chunk in files.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for f in chunk {
+                        let (icon, tone) = Self::file_icon(&f.meta.name);
+                        let date = chrono::DateTime::from_timestamp(f.meta.created, 0)
+                            .map(|d| d.with_timezone(&chrono::Local).format("%b %d, %Y").to_string())
+                            .unwrap_or_default();
+                        let info = format!("{} · {date}", transfer::human_size(f.meta.size));
+                        let (resp, actions) = w::file_card(ui, p, icon, tone(p), &f.meta.name, &info, card);
+                        if resp.drag_started() {
+                            self.drag_out = Some(DragSource::File(f.id.clone()));
+                        }
+                        let resp = resp.on_hover_text("Drag out of the window to save a decrypted copy");
+                        let mut a = ui.new_child(egui::UiBuilder::new().max_rect(actions).layout(Layout::left_to_right(Align::Center)));
+                        a.spacing_mut().item_spacing.x = 6.0;
+                        if w::ghost(&mut a, p, &format!("{}  Save", ic::DOWNLOAD)).on_hover_text("Save a decrypted copy…").clicked() {
+                            self.save_decrypted(DragSource::File(f.id.clone()));
+                        }
+                        a.with_layout(Layout::right_to_left(Align::Center), |a| {
+                            let dropping = self
+                                .file_deleting
+                                .as_ref()
+                                .filter(|(d, _)| *d == f.id)
+                                .map(|(_, t)| (t.elapsed().as_secs_f32() / DELETE_ANIM_SECS).min(1.0));
+                            let armed = self.file_confirm.as_deref() == Some(&f.id);
+                            let r = w::trash_button(a, p, &format!("softvault-file-del-{}", f.id), armed, dropping);
+                            if dropping.is_none() && r.clicked() {
+                                if armed {
+                                    self.file_deleting = Some((f.id.clone(), Instant::now()));
+                                } else {
+                                    self.file_confirm = Some(f.id.clone());
+                                }
+                            }
+                            if dropping == Some(1.0) {
+                                match self.vault.delete_file(&f.id) {
+                                    Ok(()) => self.toast(format!("“{}” deleted", f.meta.name), true),
+                                    Err(e) => self.toast(e.to_string(), false),
+                                }
+                                self.file_deleting = None;
+                                self.file_confirm = None;
+                            }
+                        });
+                        let _ = resp;
+                    }
+                });
+                ui.add_space(gap);
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!(
+                "{}  Dragging out writes a decrypted copy where you drop it. The temporary copy SoftVault hands to Windows is overwritten and deleted after 2 minutes.",
+                ic::INFO
+            )).size(12.5).color(p.weak));
+        });
+    }
+
+    /// Full-window overlay while files are dragged over SoftVault.
+    fn ui_drop_overlay(&mut self, ctx: &egui::Context, p: &Palette) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        let t = ctx.animate_bool_with_time(egui::Id::unique("softvault-drop-overlay"), hovering, 0.18);
+        if t <= 0.0 || self.view == View::Files {
+            return;
+        }
+        let n = ctx.input(|i| i.raw.hovered_files.len());
+        let screen = ctx.content_rect();
+        {
+            {
+                let painter = &ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("softvault-drop-overlay-layer")));
+                painter.rect_filled(screen, CornerRadius::ZERO, p.bg.gamma_multiply(0.86 * t));
+                let zone = screen.shrink(28.0);
+                let time = ctx.input(|i| i.time) as f32;
+                painter.rect_filled(zone, theme::R_CARD, p.accent_soft.gamma_multiply(t));
+                w::dashed_rounded_rect(painter, zone, 16.0, Stroke::new(2.0, p.accent.gamma_multiply(t)), time * 30.0);
+                let c = zone.center() - Vec2::new(0.0, 30.0);
+                let bob = (time * 4.0).sin() * 4.0;
+                painter.circle_filled(c + Vec2::new(0.0, bob), 40.0, p.accent.gamma_multiply(t));
+                painter.text(c + Vec2::new(0.0, bob), egui::Align2::CENTER_CENTER, ic::LOCK_KEYHOLE, egui::FontId::proportional(36.0), p.on_accent.gamma_multiply(t));
+                let title = format!("Drop to encrypt {} item{} into your vault", n.max(1), if n == 1 { "" } else { "s" });
+                painter.text(zone.center() + Vec2::new(0.0, 34.0), egui::Align2::CENTER_CENTER, title, egui::FontId::new(20.0, theme::semibold()), p.text.gamma_multiply(t));
+                let sub = if self.vault.settings.import_text_as_notes {
+                    "Text files become secure notes · other files go to Secure files"
+                } else {
+                    "Files are stored encrypted in Secure files"
+                };
+                let sub = if self.vault.settings.move_originals { format!("{sub} · originals will be securely deleted") } else { sub.to_string() };
+                painter.text(zone.center() + Vec2::new(0.0, 62.0), egui::Align2::CENTER_CENTER, sub, egui::FontId::proportional(13.5), p.weak.gamma_multiply(t));
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    // ─────────────────────────── vault health ───────────────────────────
+
+    fn health(&self) -> Health {
+        let mut h = Health::default();
+        let mut by_pw: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+        let year_ago = vault::now_ts() - 365 * 24 * 3600;
+        for it in self.vault.items.iter().filter(|i| i.data.kind == Kind::Password) {
+            h.logins += 1;
+            if it.data.password.is_empty() {
+                continue;
+            }
+            let (score, _, _) = generator::strength(&it.data.password);
+            if score <= 1 {
+                h.weak.push(it.id.clone());
+            }
+            by_pw.entry(it.data.password.as_str()).or_default().push(it.id.clone());
+            if it.data.updated > 0 && it.data.updated < year_ago {
+                h.old.push(it.id.clone());
+            }
+            if it.data.totp.trim().is_empty() {
+                h.no_2fa += 1;
+            }
+        }
+        for ids in by_pw.into_values() {
+            if ids.len() > 1 {
+                h.reused.extend(ids);
+            }
+        }
+        h
+    }
+
+    fn ui_health(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        w::page_header(ui, p, ic::SHIELD_CHECK, "Vault health", "Find weak, reused and old passwords");
+        ui.add_space(18.0);
+        let h = self.health();
+        let score = if h.logins == 0 {
+            100
+        } else {
+            let bad = (h.weak.len() + h.reused.len() + h.old.len()).min(h.logins * 3) as f32;
+            (100.0 - bad / (h.logins as f32 * 3.0) * 100.0).round() as i32
+        };
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(1000.0));
+            let tw = (ui.available_width() - 3.0 * 12.0) / 4.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let tone = if score >= 80 { p.success } else if score >= 50 { p.warn } else { p.danger };
+                w::stat_tile(ui, p, ic::GAUGE, &format!("{score}%"), "Health score", tone, tw);
+                w::stat_tile(ui, p, ic::SHIELD_ALERT, &h.weak.len().to_string(), "Weak passwords", if h.weak.is_empty() { p.success } else { p.danger }, tw);
+                w::stat_tile(ui, p, ic::REPEAT, &h.reused.len().to_string(), "Reused passwords", if h.reused.is_empty() { p.success } else { p.warn }, tw);
+                w::stat_tile(ui, p, ic::HISTORY, &h.old.len().to_string(), "Unchanged 1 yr+", if h.old.is_empty() { p.success } else { p.warn }, tw);
+            });
+            ui.add_space(16.0);
+            let sections: [(&str, &str, &str, &Vec<String>); 3] = [
+                (ic::SHIELD_ALERT, "Weak passwords", "Easy to guess. Replace them with generated passwords.", &h.weak),
+                (ic::REPEAT, "Reused passwords", "One breach exposes every account that shares a password.", &h.reused),
+                (ic::HISTORY, "Old passwords", "Not updated in more than a year.", &h.old),
+            ];
+            for (icon, title, desc, ids) in sections {
+                card(ui, p, |ui| {
+                    w::section_title(ui, p, icon, title, desc);
+                    if ids.is_empty() {
+                        ui.label(RichText::new(format!("{}  Nothing to fix here", ic::CIRCLE_CHECK)).color(p.success));
+                        return;
+                    }
+                    for (i, id) in ids.iter().enumerate() {
+                        let Some(it) = self.vault.items.iter().find(|x| &x.id == id) else { continue };
+                        let (t, u) = (it.data.title.clone(), it.data.username.clone());
+                        let (sc, lb, _) = generator::strength(&it.data.password);
+                        w::setting_row(ui, p, &t, &u, i + 1 == ids.len(), |ui| {
+                            if w::ghost(ui, p, &format!("{}  Fix", ic::PENCIL)).clicked() {
+                                self.select(id);
+                            }
+                            let col = if sc <= 1 { p.danger } else if sc == 2 { p.warn } else { p.success };
+                            ui.label(RichText::new(lb).size(12.5).color(col).family(theme::semibold()));
+                        });
+                    }
+                });
+                ui.add_space(12.0);
+            }
+            ui.label(RichText::new(format!("{}  {} of {} logins have no authenticator key saved.", ic::INFO, h.no_2fa, h.logins)).size(12.5).color(p.weak));
+        });
+    }
+
     fn ui_generator(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let ctx = ui.ctx().clone();
-        w::page_header(ui, p, "🎲", "Generator");
+        w::page_header(ui, p, ic::DICES, "Generator", "Create strong, random passwords");
         ui.add_space(14.0);
         if self.gen_preview.is_empty() {
             self.gen_preview = Zeroizing::new(generator::generate(&self.gen_opts));
@@ -911,17 +1540,17 @@ impl SoftVaultApp {
                 let (sc, lb, bits) = generator::strength(&self.gen_preview);
                 w::strength_bar(ui, p, sc, lb, bits);
                 ui.horizontal(|ui| {
-                    if w::primary(ui, p, "↻  Regenerate").clicked() {
+                    if w::primary(ui, p, "\u{E145}  Regenerate").clicked() {
                         self.gen_preview = Zeroizing::new(generator::generate(&self.gen_opts));
                     }
-                    if w::ghost(ui, p, "📋  Copy").clicked() {
+                    if w::ghost(ui, p, "\u{E09E}  Copy").clicked() {
                         let s = self.gen_preview.to_string();
                         self.copy(&ctx, &s, "Password");
                     }
                 });
             });
             card(ui, p, |ui| {
-                w::section_title(ui, p, "⚙", "Options", "Uses your operating system's cryptographically secure random generator");
+                w::section_title(ui, p, "\u{E154}", "Options", "Uses your operating system's cryptographically secure random generator");
                 let mut changed = ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=128).text("Length")).changed();
                 ui.horizontal_wrapped(|ui| {
                     changed |= ui.checkbox(&mut self.gen_opts.upper, "A-Z").changed();
@@ -947,7 +1576,7 @@ impl SoftVaultApp {
         card(ui, p, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.horizontal(|ui| {
-                ui.label(w::h("Note", 15.0));
+                ui.label(w::h(format!("{}  Note", ic::STICKY_NOTE), 15.0));
                 ui.add_space(8.0);
                 egui::ComboBox::from_id_salt("softvault-note-format")
                     .selected_text(ed.data.format.label())
@@ -962,12 +1591,12 @@ impl SoftVaultApp {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if w::primary(ui, p, "⛶  Full screen").on_hover_text("Open a distraction-free, full-window preview").clicked() {
+                    if w::primary(ui, p, "\u{E113}  Full screen").on_hover_text("Open a distraction-free, full-window preview").clicked() {
                         self.open_fullscreen(ed.id.clone());
                     }
                     ui.add_space(6.0);
                     if ed.data.format.has_preview() {
-                        for (m, label) in [(NoteMode::Preview, "👁 Preview"), (NoteMode::Split, "◫ Split"), (NoteMode::Edit, "✏ Edit")] {
+                        for (m, label) in [(NoteMode::Preview, "\u{E05F} Preview"), (NoteMode::Split, "\u{E098} Split"), (NoteMode::Edit, "\u{E1F9} Edit")] {
                             if w::chip(ui, p, label, ed.note_mode == m).clicked() {
                                 ed.note_mode = m;
                             }
@@ -993,11 +1622,11 @@ impl SoftVaultApp {
             }
 
             ui.horizontal(|ui| {
-                if w::ghost(ui, p, "📋  Copy").clicked() {
+                if w::ghost(ui, p, "\u{E09E}  Copy").clicked() {
                     let n = ed.data.notes.clone();
                     self.copy(ctx, &n, "Note");
                 }
-                if fmt == NoteFormat::Json && w::ghost(ui, p, "✨  Format JSON").clicked() {
+                if fmt == NoteFormat::Json && w::ghost(ui, p, "\u{E412}  Format JSON").clicked() {
                     match render::pretty_json(&ed.data.notes) {
                         Some(pretty) => ed.data.notes = pretty,
                         None => self.toast("Can't format: the JSON is invalid", false),
@@ -1066,17 +1695,17 @@ impl SoftVaultApp {
             Insert(&'static str),
         }
         let tools: [(&str, &str, A); 11] = [
-            ("B", "Bold", A::Wrap("**", "**", "bold")),
-            ("I", "Italic", A::Wrap("*", "*", "italic")),
-            ("S̶", "Strikethrough", A::Wrap("~~", "~~", "text")),
-            ("H", "Heading", A::Prefix("## ")),
-            ("•", "Bulleted list", A::Prefix("- ")),
-            ("1.", "Numbered list", A::Prefix("1. ")),
-            ("☑", "Task list", A::Prefix("- [ ] ")),
-            ("❝", "Quote", A::Prefix("> ")),
-            ("</>", "Inline code", A::Wrap("`", "`", "code")),
-            ("🔗", "Link", A::Wrap("[", "](https://)", "link text")),
-            ("▦", "Table", A::Insert("\n| Column | Value |\n|--------|-------|\n| a      | b     |\n")),
+            ("\u{E05D}", "Bold", A::Wrap("**", "**", "bold")),
+            ("\u{E0FB}", "Italic", A::Wrap("*", "*", "italic")),
+            ("\u{E177}", "Strikethrough", A::Wrap("~~", "~~", "text")),
+            ("\u{E384}", "Heading", A::Prefix("## ")),
+            ("\u{E106}", "Bulleted list", A::Prefix("- ")),
+            ("\u{E1D1}", "Numbered list", A::Prefix("1. ")),
+            ("\u{E559}", "Task list", A::Prefix("- [ ] ")),
+            ("\u{E239}", "Quote", A::Prefix("> ")),
+            ("\u{E093}", "Inline code", A::Wrap("`", "`", "code")),
+            ("\u{E102}", "Link", A::Wrap("[", "](https://)", "link text")),
+            ("\u{E17D}", "Table", A::Insert("\n| Column | Value |\n|--------|-------|\n| a      | b     |\n")),
         ];
         Frame::new().fill(p.bg_alt).corner_radius(theme::R_INPUT).inner_margin(Margin::symmetric(6, 4)).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -1092,8 +1721,8 @@ impl SoftVaultApp {
                         act = Some(a);
                     }
                 }
-                let code_block = ui.add(egui::Button::new(RichText::new("{ }").size(13.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(Vec2::new(30.0, 26.0))).on_hover_text("Code block");
-                let rule = ui.add(egui::Button::new(RichText::new("—").size(13.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(Vec2::new(30.0, 26.0))).on_hover_text("Divider");
+                let code_block = ui.add(egui::Button::new(RichText::new("\u{E36A}").size(14.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(Vec2::new(30.0, 26.0))).on_hover_text("Code block");
+                let rule = ui.add(egui::Button::new(RichText::new("\u{E11C}").size(14.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(Vec2::new(30.0, 26.0))).on_hover_text("Divider");
                 let a = if code_block.clicked() {
                     Some(&A::Insert("\n```\n\n```\n"))
                 } else if rule.clicked() {
@@ -1209,14 +1838,14 @@ impl SoftVaultApp {
 
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            if w::primary(ui, p, "✖  Close").on_hover_text("Esc").clicked() {
+                            if w::primary(ui, p, "\u{E1B2}  Close").on_hover_text("Esc").clicked() {
                                 close = true;
                             }
-                            let os_label = if fv.os_fullscreen { "🗗  Exit full screen" } else { "⛶  Full screen" };
+                            let os_label = if fv.os_fullscreen { "\u{E11B}  Exit full screen" } else { "\u{E113}  Full screen" };
                             if w::ghost(ui, p, os_label).on_hover_text("F11 — fill the whole monitor").clicked() {
                                 toggle_os = true;
                             }
-                            if w::ghost(ui, p, "📋  Copy").clicked() {
+                            if w::ghost(ui, p, "\u{E09E}  Copy").clicked() {
                                 copy = true;
                             }
                             ui.add_space(6.0);
@@ -1227,7 +1856,7 @@ impl SoftVaultApp {
                             if w::icon_btn(ui, p, "A−", "Smaller text").clicked() {
                                 new_zoom = (fv.zoom - 0.1).max(0.7);
                             }
-                            if !toc.is_empty() && w::chip(ui, p, "☰ Contents", fv.show_toc).clicked() {
+                            if !toc.is_empty() && w::chip(ui, p, "\u{E408} Contents", fv.show_toc).clicked() {
                                 fv.show_toc = !fv.show_toc;
                             }
                         });
@@ -1321,10 +1950,16 @@ impl SoftVaultApp {
         let max_body = (ctx.content_rect().height() - 220.0).max(240.0);
         let is_note = ed.data.kind == Kind::Note;
 
+        let fade = (ed.opened.elapsed().as_secs_f32() / 0.18).min(1.0);
+        let fade = 1.0 - (1.0 - fade).powi(3);
+        if fade < 1.0 {
+            ctx.request_repaint();
+        }
         egui::Modal::new(egui::Id::unique("softvault-item-dialog"))
-            .backdrop_color(Color32::from_black_alpha(if p.dark { 150 } else { 90 }))
+            .backdrop_color(Color32::from_black_alpha(((if p.dark { 150.0 } else { 90.0 }) * fade) as u8))
             .frame(Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.border)).corner_radius(theme::R_CARD).shadow(theme::soft_shadow(p)))
             .show(ctx, |ui| {
+                ui.multiply_opacity(fade);
                 ui.set_width(if is_note { (ctx.content_rect().width() - 120.0).clamp(620.0, 1120.0) } else { 620.0 });
                 ui.spacing_mut().item_spacing.y = 0.0;
                 // header
@@ -1332,14 +1967,21 @@ impl SoftVaultApp {
                     ui.horizontal(|ui| {
                         let kind = if is_note { "note" } else { "login" };
                         let title = if ed.id.is_none() { format!("New {kind}") } else { format!("Edit {kind}") };
-                        ui.label(w::h(title, 19.0));
+                        w::icon_tile(ui, p, if is_note { ed.data.format.icon() } else { ic::KEY_ROUND }, 38.0);
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(w::h(title, 18.0));
+                            let sub = if is_note { format!("Secure note · {}", ed.data.format.label()) } else { "Login".to_string() };
+                            ui.label(RichText::new(sub).size(12.5).color(p.weak));
+                        });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.add(egui::Button::new(RichText::new("✖").size(14.0).color(p.weak)).frame(false)).on_hover_text("Close").clicked() {
+                            if ui.add(egui::Button::new(RichText::new("\u{E1B2}").size(14.0).color(p.weak)).frame(false)).on_hover_text("Close").clicked() {
                                 close = true;
                             }
                             ui.add_space(6.0);
-                            let star = if ed.data.favorite { "★" } else { "☆" };
-                            if ui.add(egui::Button::new(RichText::new(star).size(17.0).color(p.warn)).frame(false)).on_hover_text("Favorite").clicked() {
+                            let star = ic::STAR;
+                            if ui.add(egui::Button::new(RichText::new(star).size(17.0).color(if ed.data.favorite { p.warn } else { p.weak })).frame(false)).on_hover_text("Favorite").clicked() {
                                 ed.data.favorite = !ed.data.favorite;
                             }
                         });
@@ -1355,7 +1997,7 @@ impl SoftVaultApp {
                         ui.spacing_mut().item_spacing.y = 12.0;
                         card(ui, p, |ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
-                            ui.label(w::h("Item details", 15.0));
+                            ui.label(w::h(format!("{}  Item details", ic::INFO), 15.0));
                             w::label(ui, p, "Item name (required)");
                             w::text_input(ui, &mut ed.data.title, if is_note { "e.g. Recovery codes" } else { "e.g. GitHub" }, false);
                         });
@@ -1363,10 +2005,10 @@ impl SoftVaultApp {
                         if !is_note {
                             card(ui, p, |ui| {
                                 ui.spacing_mut().item_spacing.y = 6.0;
-                                ui.label(w::h("Login credentials", 15.0));
+                                ui.label(w::h(format!("{}  Login credentials", ic::KEY_ROUND), 15.0));
                                 w::label(ui, p, "Username");
                                 w::row_rtl(ui, |ui| {
-                                    if w::icon_btn(ui, p, "📋", "Copy username").clicked() {
+                                    if w::icon_btn(ui, p, "\u{E09E}", "Copy username").clicked() {
                                         let u = ed.data.username.clone();
                                         self.copy(ctx, &u, "Username");
                                     }
@@ -1374,14 +2016,14 @@ impl SoftVaultApp {
                                 });
                                 w::label(ui, p, "Password");
                                 w::row_rtl(ui, |ui| {
-                                    if w::icon_btn(ui, p, "↻", "Generate password").clicked() {
+                                    if w::icon_btn(ui, p, "\u{E145}", "Generate password").clicked() {
                                         ed.show_gen = !ed.show_gen;
                                     }
-                                    if w::icon_btn(ui, p, "📋", "Copy password").clicked() {
+                                    if w::icon_btn(ui, p, "\u{E09E}", "Copy password").clicked() {
                                         let pw = ed.data.password.clone();
                                         self.copy(ctx, &pw, "Password");
                                     }
-                                    if w::icon_btn(ui, p, if ed.show_pw { "🙈" } else { "👁" }, "Toggle visibility").clicked() {
+                                    if w::icon_btn(ui, p, if ed.show_pw { "\u{E0BB}" } else { "\u{E0BA}" }, "Toggle visibility").clicked() {
                                         ed.show_pw = !ed.show_pw;
                                     }
                                     ui.add_sized(
@@ -1412,7 +2054,7 @@ impl SoftVaultApp {
                                 w::row_rtl(ui, |ui| {
                                     if let Some(sec) = totp::base32_decode(&ed.data.totp).filter(|s| s.len() >= 10) {
                                         let code = format!("{:06}", totp::hotp(&sec, totp::now_step()));
-                                        if w::icon_btn(ui, p, "📋", "Copy verification code").clicked() {
+                                        if w::icon_btn(ui, p, "\u{E09E}", "Copy verification code").clicked() {
                                             self.copy(ctx, &code, "Verification code");
                                         }
                                     }
@@ -1422,12 +2064,12 @@ impl SoftVaultApp {
                                     let code = format!("{:06}", totp::hotp(&sec, totp::now_step()));
                                     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
                                     let left = totp::PERIOD - secs % totp::PERIOD;
-                                    ui.label(RichText::new(format!("{} {}   ⏱ {left}s", &code[..3], &code[3..])).monospace().size(19.0).color(p.accent));
+                                    ui.label(RichText::new(format!("{} {}   \u{E1E0} {left}s", &code[..3], &code[3..])).monospace().size(19.0).color(p.accent));
                                 }
                             });
                             card(ui, p, |ui| {
                                 ui.spacing_mut().item_spacing.y = 6.0;
-                                ui.label(w::h("Autofill options", 15.0));
+                                ui.label(w::h(format!("{}  Autofill options", ic::GLOBE), 15.0));
                                 w::label(ui, p, "Website (URI)");
                                 w::text_input(ui, &mut ed.data.url, "https://", false);
                             });
@@ -1438,7 +2080,7 @@ impl SoftVaultApp {
                         } else {
                             card(ui, p, |ui| {
                                 ui.spacing_mut().item_spacing.y = 6.0;
-                                ui.label(w::h("Additional options", 15.0));
+                                ui.label(w::h(format!("{}  Additional options", ic::STICKY_NOTE), 15.0));
                                 w::label(ui, p, "Notes");
                                 ui.add(egui::TextEdit::multiline(&mut ed.data.notes).desired_rows(4).desired_width(f32::INFINITY).margin(Margin::symmetric(12, 10)));
                             });
@@ -1466,21 +2108,27 @@ impl SoftVaultApp {
                         if w::ghost(ui, p, "Cancel").clicked() {
                             close = true;
                         }
-                        if ed.id.is_some() {
+                        if let Some(item_id) = ed.id.clone() {
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ed.confirm_delete {
-                                    if w::danger(ui, p, "Delete permanently").clicked() {
-                                        delete = true;
+                                let dropping = self
+                                    .deleting
+                                    .as_ref()
+                                    .filter(|(d, _)| *d == item_id)
+                                    .map(|(_, t)| (t.elapsed().as_secs_f32() / DELETE_ANIM_SECS).min(1.0));
+                                let r = w::trash_button(ui, p, "softvault-delete", ed.confirm_delete, dropping);
+                                if dropping.is_none() {
+                                    if r.clicked() {
+                                        if ed.confirm_delete {
+                                            self.deleting = Some((item_id.clone(), Instant::now()));
+                                        } else {
+                                            ed.confirm_delete = true;
+                                        }
                                     }
-                                    if ui.add(egui::Button::new(RichText::new("Keep").color(p.weak)).frame(false)).clicked() {
+                                    if ed.confirm_delete && ui.add(egui::Button::new(RichText::new("Keep").color(p.weak)).frame(false)).clicked() {
                                         ed.confirm_delete = false;
                                     }
-                                } else if ui
-                                    .add(egui::Button::new(RichText::new("🗑").size(15.0).color(p.danger)).fill(Color32::TRANSPARENT).stroke(Stroke::new(1.0, p.danger)).corner_radius(theme::PILL).min_size(Vec2::splat(36.0)))
-                                    .on_hover_text("Delete")
-                                    .clicked()
-                                {
-                                    ed.confirm_delete = true;
+                                } else if dropping == Some(1.0) {
+                                    delete = true;
                                 }
                             });
                         }
@@ -1506,9 +2154,15 @@ impl SoftVaultApp {
             }
         }
         if delete && let Some(id) = ed.id.clone() {
+            self.deleting = None;
+            let backup = self.vault.items.iter().find(|i| i.id == id).map(|i| i.data.clone());
             match self.vault.delete_item(&id) {
                 Ok(()) => {
-                    self.toast("Item deleted", true);
+                    if let Some(data) = backup {
+                        let title = if data.title.is_empty() { "Item".to_string() } else { data.title.clone() };
+                        self.undo = Some(UndoDelete { id, data, title, until: Instant::now() + Duration::from_secs(UNDO_SECS) });
+                        self.toast = None;
+                    }
                     self.selected = None;
                     return;
                 }
@@ -1533,148 +2187,211 @@ impl SoftVaultApp {
                 self.su.email = r.email.clone();
             }
         }
-        w::page_header(ui, p, "⚙", "Settings");
-        ui.add_space(8.0);
+        w::page_header(ui, p, ic::SETTINGS, "Settings", "Security, recovery, appearance and backups");
+        ui.add_space(14.0);
+        let tabs = [
+            (ic::SHIELD_CHECK, "Security"),
+            (ic::MAIL, "Recovery"),
+            (ic::PALETTE, "Appearance"),
+            (ic::HARD_DRIVE, "Backup & storage"),
+            (ic::INFO, "About"),
+        ];
+        if let Some(t) = w::tabs(ui, p, &tabs, self.su.tab) {
+            self.su.tab = t;
+        }
 
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(ui.available_width().min(820.0));
-            ui.spacing_mut().item_spacing.y = 10.0;
+            ui.set_max_width(ui.available_width().min(880.0));
+            ui.spacing_mut().item_spacing.y = 14.0;
+            match self.su.tab {
+                0 => self.settings_security(ui, p, &ctx),
+                1 => self.settings_recovery(ui, p, &ctx),
+                2 => self.settings_appearance(ui, p),
+                3 => self.settings_backup(ui, p, &ctx),
+                _ => self.settings_about(ui, p),
+            }
+            ui.add_space(24.0);
+        });
+    }
 
-            // ── Appearance & behaviour
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "🎨", "Appearance & behaviour", "Theme, auto-lock and clipboard");
-                ui.horizontal(|ui| {
-                    ui.label("Theme");
-                    if ui.selectable_label(self.dark, "🌙 Dark").clicked() {
-                        self.set_theme(true);
-                    }
-                    if ui.selectable_label(!self.dark, "☀ Light").clicked() {
-                        self.set_theme(false);
-                    }
+    fn settings_security(&mut self, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context) {
+        // ── 2FA
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::SMARTPHONE, "Two-step login", "Ask for a code from your phone's authenticator app on every unlock (optional).");
+            if self.vault.settings.mfa_secret.is_some() {
+                w::setting_row(ui, p, "Status", "A 6-digit code is required after your master password.", false, |ui| {
+                    ui.label(RichText::new(format!("{}  Enabled", ic::CIRCLE_CHECK)).color(p.success).family(theme::semibold()));
                 });
-                let mut changed = false;
-                changed |= ui.add(egui::Slider::new(&mut self.vault.settings.auto_lock_minutes, 1..=60).text("min · auto-lock after inactivity")).changed();
-                changed |= ui.add(egui::Slider::new(&mut self.vault.settings.clipboard_clear_secs, 5..=120).text("s · clear clipboard after copy")).changed();
-                if changed {
-                    let _ = self.vault.save_settings();
-                }
-            });
-
-            // ── MFA
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "📱", "Two-factor authentication (optional)", "Require a code from your phone's authenticator app on every unlock");
-                if self.vault.settings.mfa_secret.is_some() {
-                    ui.label(RichText::new("✅ Enabled — a 6-digit code is required after your master password.").color(p.success));
-                    ui.horizontal(|ui| {
-                        ui.add_sized([160.0, 32.0], egui::TextEdit::singleline(&mut self.su.mfa_code).hint_text("Current code").margin(Margin::symmetric(10, 8)));
-                        if w::danger(ui, p, "Disable 2FA").clicked() {
-                            let sec = self.vault.settings.mfa_secret.clone().unwrap_or_default();
-                            if let Some(step) = totp::verify(&sec, &self.su.mfa_code, self.vault.settings.mfa_last_step) {
-                                self.vault.settings.mfa_secret = None;
-                                self.vault.settings.mfa_last_step = step;
-                                let _ = self.vault.save_settings();
-                                self.toast("Two-factor authentication disabled", true);
-                            } else {
-                                self.toast("Invalid code", false);
-                            }
-                            self.su.mfa_code.clear();
+                w::setting_row(ui, p, "Turn off two-step login", "Enter a current code from your authenticator app to confirm.", true, |ui| {
+                    if w::danger(ui, p, "Turn off").clicked() {
+                        let sec = self.vault.settings.mfa_secret.clone().unwrap_or_default();
+                        if let Some(step) = totp::verify(&sec, &self.su.mfa_code, self.vault.settings.mfa_last_step) {
+                            self.vault.settings.mfa_secret = None;
+                            self.vault.settings.mfa_last_step = step;
+                            let _ = self.vault.save_settings();
+                            self.toast("Two-step login turned off", true);
+                        } else {
+                            self.toast("Invalid code", false);
                         }
+                        self.su.mfa_code.clear();
+                    }
+                    ui.add_sized([130.0, 36.0], egui::TextEdit::singleline(&mut self.su.mfa_code).hint_text("123456").margin(Margin::symmetric(10, 9)));
+                });
+            } else if let Some(secret) = self.su.mfa_setup.clone() {
+                ui.horizontal_top(|ui| {
+                    Frame::new().fill(Color32::WHITE).corner_radius(theme::R_INPUT).inner_margin(Margin::same(6)).show(ui, |ui| {
+                        w::draw_qr(ui, &totp::otpauth_uri(&secret, "vault"), 176.0);
                     });
-                } else if let Some(secret) = self.su.mfa_setup.clone() {
-                    ui.label("1. Scan this QR code with Google Authenticator, Microsoft Authenticator, Authy, 2FAS or Aegis:");
-                    ui.horizontal(|ui| {
-                        w::draw_qr(ui, &totp::otpauth_uri(&secret, "vault"), 190.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Or enter the key manually:").color(p.weak).size(12.5));
-                            let grouped: String = secret.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap_or("")).collect::<Vec<_>>().join(" ");
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        ui.label(w::h("1.  Scan the QR code", 14.0));
+                        ui.label(RichText::new("Google Authenticator, Microsoft Authenticator, Authy, 2FAS or Aegis.").size(12.5).color(p.weak));
+                        ui.label(RichText::new("Can't scan? Enter this key manually:").size(12.5).color(p.weak));
+                        let grouped: String = secret.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap_or("")).collect::<Vec<_>>().join(" ");
+                        ui.horizontal(|ui| {
                             ui.label(RichText::new(grouped).monospace().size(13.0));
-                            if w::ghost(ui, p, "📋 Copy key").clicked() {
-                                self.copy(&ctx, &secret, "Secret key");
+                            if w::ghost_icon(ui, p, ic::COPY, "Copy key").clicked() {
+                                self.copy(ctx, &secret, "Setup key");
                             }
-                            ui.add_space(8.0);
-                            ui.label("2. Enter the 6-digit code shown in the app:");
-                            ui.horizontal(|ui| {
-                                ui.add_sized([140.0, 32.0], egui::TextEdit::singleline(&mut self.su.mfa_code).hint_text("123456").margin(Margin::symmetric(10, 8)));
-                                if w::primary(ui, p, "Enable").clicked() {
-                                    if let Some(step) = totp::verify(&secret, &self.su.mfa_code, 0) {
-                                        self.vault.settings.mfa_secret = Some(secret.clone());
-                                        self.vault.settings.mfa_last_step = step;
-                                        match self.vault.save_settings() {
-                                            Ok(()) => self.toast("Two-factor authentication enabled", true),
-                                            Err(e) => self.toast(e.to_string(), false),
-                                        }
-                                        self.su.mfa_setup = None;
-                                    } else {
-                                        self.toast("Code doesn't match — check your phone's clock", false);
+                        });
+                        ui.add_space(4.0);
+                        ui.label(w::h("2.  Enter the 6-digit code", 14.0));
+                        ui.horizontal(|ui| {
+                            ui.add_sized([130.0, 36.0], egui::TextEdit::singleline(&mut self.su.mfa_code).hint_text("123456").margin(Margin::symmetric(10, 9)));
+                            if w::primary(ui, p, "Turn on").clicked() {
+                                if let Some(step) = totp::verify(&secret, &self.su.mfa_code, 0) {
+                                    self.vault.settings.mfa_secret = Some(secret.clone());
+                                    self.vault.settings.mfa_last_step = step;
+                                    match self.vault.save_settings() {
+                                        Ok(()) => self.toast("Two-step login turned on", true),
+                                        Err(e) => self.toast(e.to_string(), false),
                                     }
-                                    self.su.mfa_code.clear();
+                                    self.su.mfa_setup = None;
+                                } else {
+                                    self.toast("Code doesn't match. Check your phone's clock.", false);
                                 }
-                            });
+                                self.su.mfa_code.clear();
+                            }
                             if w::ghost(ui, p, "Cancel").clicked() {
                                 self.su.mfa_setup = None;
                             }
                         });
                     });
-                } else {
-                    ui.label(RichText::new("Off").color(p.weak));
-                    if w::primary(ui, p, "Set up 2FA").clicked() {
+                });
+            } else {
+                w::setting_row(ui, p, "Authenticator app", "Not set up. Your vault is protected by your master password only.", true, |ui| {
+                    if w::primary(ui, p, "Set up").clicked() {
                         self.su.mfa_setup = Some(totp::base32_encode(&totp::generate_secret()));
                     }
-                }
-            });
+                });
+            }
+        });
 
-            // ── Recovery email + hint
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "📧", "Password hint & recovery Gmail", "Your hint is emailed only to a Gmail address you've verified");
-                let rec = self.vault.recovery();
-                match &rec {
-                    Some(r) if r.verified => {
-                        ui.label(RichText::new(format!("✅ Verified: {}", r.email)).color(p.success));
-                        if w::ghost(ui, p, "Remove recovery email").clicked() {
+        // ── session
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::TIMER, "Session", "Limit how long your vault stays open.");
+            let mut changed = false;
+            w::setting_row(ui, p, "Vault timeout", "Lock automatically after this many minutes without activity.", false, |ui| {
+                let cur = self.vault.settings.auto_lock_minutes;
+                egui::ComboBox::from_id_salt("softvault-timeout")
+                    .width(150.0)
+                    .selected_text(if cur >= 60 { format!("{} hour", cur / 60) } else { format!("{cur} minutes") })
+                    .show_ui(ui, |ui| {
+                        for (m, l) in [(1, "1 minute"), (5, "5 minutes"), (15, "15 minutes"), (30, "30 minutes"), (60, "1 hour")] {
+                            changed |= ui.selectable_value(&mut self.vault.settings.auto_lock_minutes, m, l).changed();
+                        }
+                    });
+            });
+            w::setting_row(ui, p, "Clear clipboard", "Remove copied passwords from the clipboard after this many seconds.", true, |ui| {
+                let cur = self.vault.settings.clipboard_clear_secs;
+                egui::ComboBox::from_id_salt("softvault-clipboard")
+                    .width(150.0)
+                    .selected_text(if cur >= 60 { format!("{} minute{}", cur / 60, if cur >= 120 { "s" } else { "" }) } else { format!("{cur} seconds") })
+                    .show_ui(ui, |ui| {
+                        for (sec, l) in [(10, "10 seconds"), (20, "20 seconds"), (30, "30 seconds"), (60, "1 minute"), (120, "2 minutes")] {
+                            changed |= ui.selectable_value(&mut self.vault.settings.clipboard_clear_secs, sec, l).changed();
+                        }
+                    });
+            });
+            if changed {
+                let _ = self.vault.save_settings();
+            }
+        });
+
+        // ── master password
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::KEY_ROUND, "Change master password", "Your vault key is re-wrapped with a new Argon2id-derived key. Items don't need re-encrypting.");
+            ui.spacing_mut().item_spacing.y = 6.0;
+            w::label(ui, p, "Current master password");
+            w::text_input(ui, &mut self.su.old_pw, "", true);
+            ui.columns(2, |c| {
+                w::label(&mut c[0], p, "New master password");
+                w::text_input(&mut c[0], &mut self.su.new_pw, "12+ characters", true);
+                w::label(&mut c[1], p, "Confirm new master password");
+                w::text_input(&mut c[1], &mut self.su.new_pw2, "", true);
+            });
+            let (sc, lb, bits) = generator::strength(&self.su.new_pw);
+            w::strength_bar(ui, p, sc, lb, bits);
+            ui.add_space(4.0);
+            if let Some(b) = &self.busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(b.as_str());
+                });
+            } else if w::primary(ui, p, "Change master password").clicked() {
+                if self.su.new_pw.chars().count() < 12 {
+                    self.toast("New password must be at least 12 characters", false);
+                } else if *self.su.new_pw != *self.su.new_pw2 {
+                    self.toast("New passwords don't match", false);
+                } else if let Ok(m) = self.vault.unlock_material() {
+                    let old = Zeroizing::new(self.su.old_pw.as_bytes().to_vec());
+                    let new = Zeroizing::new(self.su.new_pw.as_bytes().to_vec());
+                    self.spawn(ctx, Some("Re-encrypting vault key…"), move || {
+                        JobResult::Rewrapped(crypto::unwrap_vault_key(&old, &m.params, &m.salt, &m.wrapped).and_then(|k| crypto::rewrap(&k, &new)))
+                    });
+                }
+            }
+        });
+    }
+
+    fn settings_recovery(&mut self, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context) {
+        let rec = self.vault.recovery();
+        let verified = rec.as_ref().map(|r| r.verified) == Some(true);
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::MAIL, "Recovery Gmail", "Your master password hint can be emailed only to a Gmail address you've verified.");
+            match &rec {
+                Some(r) if r.verified => {
+                    w::setting_row(ui, p, "Verified address", &r.email, true, |ui| {
+                        if w::ghost(ui, p, "Remove").clicked() {
                             let _ = self.vault.delete_meta("recovery");
                             self.su.email.clear();
                             self.toast("Recovery email removed", true);
                         }
-                    }
-                    _ => {
-                        w::label(ui, p, "Gmail address");
-                        w::text_input(ui, &mut self.su.email, "you@gmail.com", false);
-                        w::label(ui, p, "Google app password");
-                        w::text_input(ui, &mut self.su.app_pw, "16-character app password", true);
-                        ui.label(RichText::new("Create one at myaccount.google.com → Security → 2-Step Verification → App passwords. It's stored encrypted with Windows DPAPI (bound to your Windows account) so the hint can be sent while the vault is locked.").size(11.5).color(p.weak));
-                        if self.su.verify_sent && self.su.pending_verify.is_some() {
-                            ui.horizontal(|ui| {
-                                ui.add_sized([150.0, 32.0], egui::TextEdit::singleline(&mut self.su.verify_input).hint_text("Code from email").margin(Margin::symmetric(10, 8)));
-                                if w::primary(ui, p, "Verify").clicked() {
-                                    let (email, app_pw, code, sent) = self.su.pending_verify.as_ref().unwrap();
-                                    if sent.elapsed() > Duration::from_secs(600) {
-                                        self.toast("Code expired — send a new one", false);
-                                    } else if self.su.verify_input.trim() == code.as_str() {
-                                        let r = Recovery { email: email.clone(), app_password: app_pw.to_string(), verified: true };
-                                        match self.vault.set_recovery(&r) {
-                                            Ok(()) => self.toast("Gmail verified ✓", true),
-                                            Err(e) => self.toast(e.to_string(), false),
-                                        }
-                                        self.su.pending_verify = None;
-                                        self.su.verify_sent = false;
-                                        self.su.app_pw.zeroize();
-                                    } else {
-                                        self.toast("Wrong verification code", false);
-                                    }
-                                    self.su.verify_input.clear();
-                                }
-                            });
-                        }
+                        ui.label(RichText::new(format!("{}  Verified", ic::BADGE_CHECK)).color(p.success).family(theme::semibold()));
+                    });
+                }
+                _ => {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.columns(2, |c| {
+                        w::label(&mut c[0], p, "Gmail address");
+                        w::text_input(&mut c[0], &mut self.su.email, "you@gmail.com", false);
+                        w::label(&mut c[1], p, "Google app password");
+                        w::text_input(&mut c[1], &mut self.su.app_pw, "xxxx xxxx xxxx xxxx", true);
+                    });
+                    Frame::new().fill(p.bg_alt).corner_radius(theme::R_INPUT).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(RichText::new(format!("{}  Create an app password at myaccount.google.com → Security → 2-Step Verification → App passwords. It's protected with Windows DPAPI so your hint can be sent while the vault is locked.", ic::INFO)).size(12.5).color(p.weak));
+                    });
+                    ui.horizontal(|ui| {
                         if self.mail_busy {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("Sending…");
-                            });
-                        } else if w::ghost(ui, p, "✉ Send verification code").clicked() {
+                            ui.spinner();
+                            ui.label("Sending…");
+                        } else if w::ghost(ui, p, &format!("{}  Send verification code", ic::MAIL)).clicked() {
                             if !mailer::is_gmail(&self.su.email) {
                                 self.toast("Please enter a @gmail.com address", false);
                             } else if self.su.app_pw.replace(' ', "").len() < 16 {
-                                self.toast("Enter your 16-character Google App Password", false);
+                                self.toast("Enter your 16-character Google app password", false);
                             } else {
                                 use rand::Rng;
                                 let code = Zeroizing::new(format!("{:06}", rand::rngs::OsRng.gen_range(0..1_000_000u32)));
@@ -1683,180 +2400,359 @@ impl SoftVaultApp {
                                 self.su.pending_verify = Some((email.clone(), app_pw.clone(), code.clone(), Instant::now()));
                                 self.su.verify_sent = false;
                                 self.mail_busy = true;
-                                self.spawn(&ctx, None, move || {
+                                self.spawn(ctx, None, move || {
                                     let body = format!("Your SoftVault verification code is: {}\n\nIt expires in 10 minutes.", code.as_str());
                                     JobResult::VerifyMailSent(mailer::send_to_self(&email, &app_pw, "SoftVault verification code", body))
                                 });
                             }
                         }
+                        if self.su.verify_sent && self.su.pending_verify.is_some() {
+                            ui.add_space(8.0);
+                            ui.add_sized([130.0, 36.0], egui::TextEdit::singleline(&mut self.su.verify_input).hint_text("Code").margin(Margin::symmetric(10, 9)));
+                            if w::primary(ui, p, "Verify").clicked() {
+                                let (email, app_pw, code, sent) = self.su.pending_verify.as_ref().unwrap();
+                                if sent.elapsed() > Duration::from_secs(600) {
+                                    self.toast("Code expired. Send a new one.", false);
+                                } else if self.su.verify_input.trim() == code.as_str() {
+                                    let r = Recovery { email: email.clone(), app_password: app_pw.to_string(), verified: true };
+                                    match self.vault.set_recovery(&r) {
+                                        Ok(()) => self.toast("Gmail verified", true),
+                                        Err(e) => self.toast(e.to_string(), false),
+                                    }
+                                    self.su.pending_verify = None;
+                                    self.su.verify_sent = false;
+                                    self.su.app_pw.zeroize();
+                                } else {
+                                    self.toast("Wrong verification code", false);
+                                }
+                                self.su.verify_input.clear();
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::CIRCLE_HELP, "Master password hint", "Never shown on screen; only emailed to your verified Gmail from the lock screen.");
+            w::row_rtl(ui, |ui| {
+                if w::primary(ui, p, "Save hint").clicked() {
+                    match self.vault.set_hint(&self.su.hint) {
+                        Ok(()) => self.toast("Hint saved", true),
+                        Err(e) => self.toast(e.to_string(), false),
                     }
                 }
-                ui.separator();
-                w::label(ui, p, "Master password hint");
-                w::row_rtl(ui, |ui| {
-                    if w::primary(ui, p, "Save hint").clicked() {
-                        match self.vault.set_hint(&self.su.hint) {
-                            Ok(()) => self.toast("Hint saved", true),
-                            Err(e) => self.toast(e.to_string(), false),
-                        }
+                ui.add_sized([ui.available_width(), 36.0], egui::TextEdit::singleline(&mut *self.su.hint).hint_text("No hint set").margin(Margin::symmetric(12, 9)));
+            });
+            if !verified {
+                ui.label(RichText::new(format!("{}  Verify a Gmail address above, otherwise the hint can't be retrieved.", ic::TRIANGLE_ALERT)).size(12.5).color(p.warn));
+            }
+        });
+    }
+
+    fn settings_appearance(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::PALETTE, "Appearance", "Choose how SoftVault looks on this computer.");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                for (dark, name, icon) in [(false, "Light", ic::SUN), (true, "Dark", ic::MOON)] {
+                    let sel = self.dark == dark;
+                    let preview = theme::palette(dark);
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(210.0, 150.0), egui::Sense::click());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, theme::R_CARD, preview.bg);
+                    painter.rect_stroke(rect, theme::R_CARD, Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { p.accent } else { p.border }), egui::StrokeKind::Inside);
+                    // mini mock-up of the app
+                    let inner = rect.shrink(10.0);
+                    let side = egui::Rect::from_min_size(inner.min, Vec2::new(48.0, inner.height() - 30.0));
+                    painter.rect_filled(side, CornerRadius::same(6), preview.panel);
+                    painter.rect_filled(egui::Rect::from_min_size(side.min + Vec2::new(6.0, 10.0), Vec2::new(36.0, 8.0)), CornerRadius::same(3), preview.nav_active);
+                    for i in 0..3 {
+                        let y = inner.top() + 10.0 + i as f32 * 22.0;
+                        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(side.right() + 10.0, y), Vec2::new(inner.right() - side.right() - 10.0, 14.0)), CornerRadius::same(4), preview.card_hover);
                     }
-                    ui.add_sized([ui.available_width(), 34.0], egui::TextEdit::singleline(&mut *self.su.hint).hint_text("No hint set").margin(Margin::symmetric(12, 9)));
-                });
-                if rec.map(|r| r.verified) != Some(true) {
-                    ui.label(RichText::new("⚠ The hint can't be retrieved until a Gmail address is verified.").size(12.0).color(p.warn));
+                    painter.text(egui::pos2(inner.left() + 4.0, inner.bottom() - 6.0), egui::Align2::LEFT_BOTTOM, format!("{icon}  {name}"), egui::FontId::new(13.5, theme::semibold()), preview.text);
+                    if sel {
+                        painter.text(egui::pos2(inner.right() - 4.0, inner.bottom() - 6.0), egui::Align2::RIGHT_BOTTOM, ic::CIRCLE_CHECK, egui::FontId::proportional(16.0), preview.accent);
+                    }
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        self.set_theme(dark);
+                    }
                 }
             });
+        });
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::KEYBOARD, "Keyboard shortcuts", "Work faster without the mouse.");
+            egui::Grid::new("softvault-shortcuts").num_columns(2).spacing([40.0, 10.0]).striped(false).show(ui, |ui| {
+                for (k, d) in [
+                    ("Ctrl + F", "Search the vault"),
+                    ("Ctrl + N", "New login"),
+                    ("Ctrl + Shift + N", "New secure note"),
+                    ("Ctrl + L", "Lock the vault"),
+                    ("Ctrl + S", "Save the open item"),
+                    ("Esc", "Close dialog or full-screen preview"),
+                    ("F11", "Full screen (in note preview)"),
+                ] {
+                    Frame::new().fill(p.bg_alt).stroke(Stroke::new(1.0, p.border)).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(8, 3)).show(ui, |ui| {
+                        ui.label(RichText::new(k).monospace().size(12.5));
+                    });
+                    ui.label(RichText::new(d).size(13.5));
+                    ui.end_row();
+                }
+            });
+        });
+    }
 
-            // ── Change master password
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "🔑", "Change master password", "Re-wraps your vault key with a new Argon2id-derived key");
-                w::text_input(ui, &mut self.su.old_pw, "Current master password", true);
-                w::text_input(ui, &mut self.su.new_pw, "New master password (12+ characters)", true);
-                let (sc, lb, bits) = generator::strength(&self.su.new_pw);
-                w::strength_bar(ui, p, sc, lb, bits);
-                w::text_input(ui, &mut self.su.new_pw2, "Confirm new master password", true);
-                if self.busy.is_some() {
+    fn settings_backup(&mut self, ui: &mut egui::Ui, p: &Palette, ctx: &egui::Context) {
+        // ── storage location
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::DATABASE, "Storage location", "Where your encrypted vault database lives.");
+            let loc = self.db_location.clone();
+            let mode = if loc.portable { "Portable: stored next to SoftVault.exe" } else { "Stored in your Windows profile (the app's folder is read-only)" };
+            w::setting_row(ui, p, "Database file", mode, false, |ui| {
+                if w::ghost(ui, p, &format!("{}  Open folder", ic::FOLDER_OPEN)).clicked()
+                    && let Some(dir) = loc.path.parent()
+                {
+                    #[cfg(windows)]
+                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    #[cfg(not(windows))]
+                    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                }
+            });
+            Frame::new().fill(p.bg_alt).corner_radius(theme::R_INPUT).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(loc.path.display().to_string()).monospace().size(12.5)).selectable(true));
+            });
+            if loc.portable {
+                ui.label(RichText::new(format!("{}  Back up the whole folder to back up everything. The file is fully encrypted. Your Gmail recovery settings are tied to this Windows account; on another PC, just set them up again.", ic::INFO)).size(12.5).color(p.weak));
+            }
+            w::setting_row(ui, p, "Back up database now", "Save an encrypted copy of vault.db. Restore it by placing it next to SoftVault.exe.", true, |ui| {
+                if w::primary(ui, p, &format!("{}  Back up…", ic::SAVE)).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("vault-backup-{}.db", chrono::Local::now().format("%Y-%m-%d")))
+                        .add_filter("SoftVault database", &["db"])
+                        .save_file()
+                {
+                    match self.vault.backup_to(&path) {
+                        Ok(()) => self.toast(format!("Backup saved to {}", path.display()), true),
+                        Err(e) => self.toast(format!("Backup failed: {e}"), false),
+                    }
+                }
+            });
+        });
+
+        // ── export
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::DOWNLOAD, "Export vault", "Save all logins and notes to a file.");
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(w::h(format!("{}  Encrypted (.svx), recommended", ic::LOCK), 14.0));
+            ui.label(RichText::new("Protected with Argon2id + XChaCha20-Poly1305 using a password you choose.").size(12.5).color(p.weak));
+            ui.columns(2, |c| {
+                w::text_input(&mut c[0], &mut self.su.export_pw, "File password (12+ characters)", true);
+                w::text_input(&mut c[1], &mut self.su.export_pw2, "Confirm file password", true);
+            });
+            if let Some(b) = &self.busy {
+                ui.horizontal(|ui| {
                     ui.spinner();
-                } else if w::primary(ui, p, "Change password").clicked() {
-                    if self.su.new_pw.chars().count() < 12 {
-                        self.toast("New password must be at least 12 characters", false);
-                    } else if *self.su.new_pw != *self.su.new_pw2 {
-                        self.toast("New passwords don't match", false);
-                    } else if let Ok(m) = self.vault.unlock_material() {
-                        let old = Zeroizing::new(self.su.old_pw.as_bytes().to_vec());
-                        let new = Zeroizing::new(self.su.new_pw.as_bytes().to_vec());
-                        self.spawn(&ctx, Some("Re-encrypting vault key…"), move || {
-                            JobResult::Rewrapped(
-                                crypto::unwrap_vault_key(&old, &m.params, &m.salt, &m.wrapped).and_then(|k| crypto::rewrap(&k, &new)),
-                            )
+                    ui.label(b.as_str());
+                });
+            } else if w::primary(ui, p, &format!("{}  Export encrypted…", ic::DOWNLOAD)).clicked() {
+                if self.su.export_pw.chars().count() < 12 {
+                    self.toast("File password must be at least 12 characters", false);
+                } else if *self.su.export_pw != *self.su.export_pw2 {
+                    self.toast("File passwords don't match", false);
+                } else if let Some(path) = rfd::FileDialog::new()
+                    .set_file_name(format!("softvault-export-{}.svx", chrono::Local::now().format("%Y-%m-%d")))
+                    .add_filter("SoftVault encrypted export", &["svx"])
+                    .save_file()
+                {
+                    match self.vault.export_json() {
+                        Ok(json) => {
+                            let pw = Zeroizing::new(self.su.export_pw.as_bytes().to_vec());
+                            self.spawn(ctx, Some("Encrypting export…"), move || JobResult::Exported(crypto::encrypt_export(&json, &pw), path));
+                        }
+                        Err(e) => self.toast(e.to_string(), false),
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, CornerRadius::ZERO, p.border);
+            ui.add_space(8.0);
+            ui.label(w::h(format!("{}  Unencrypted (.json)", ic::TRIANGLE_ALERT), 14.0).color(p.warn));
+            ui.horizontal(|ui| {
+                w::toggle(ui, p, &mut self.su.plain_ack);
+                ui.label(RichText::new("I understand this file will contain all my passwords and notes in plain text").size(13.0));
+            });
+            ui.add_enabled_ui(self.su.plain_ack, |ui| {
+                if w::ghost(ui, p, &format!("{}  Export unencrypted…", ic::DOWNLOAD)).clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("softvault-plaintext-{}.json", chrono::Local::now().format("%Y-%m-%d")))
+                        .add_filter("JSON", &["json"])
+                        .save_file()
+                {
+                    match self.vault.export_json().and_then(|j| std::fs::write(&path, &*j).map_err(Into::into)) {
+                        Ok(()) => self.toast(format!("Plain export saved to {}", path.display()), true),
+                        Err(e) => self.toast(format!("Export failed: {e}"), false),
+                    }
+                    self.su.plain_ack = false;
+                }
+            });
+        });
+
+        // ── import
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::UPLOAD, "Import", "Add items from a SoftVault export (.svx or .json). Existing items are kept.");
+            if self.su.import_bytes.is_some() {
+                ui.label(RichText::new("This file is encrypted. Enter its file password:").size(13.0));
+                w::row_rtl(ui, |ui| {
+                    if w::ghost(ui, p, "Cancel").clicked() {
+                        self.su.import_bytes = None;
+                    }
+                    if self.busy.is_none() && w::primary(ui, p, "Decrypt & import").clicked() {
+                        let bytes = self.su.import_bytes.clone().unwrap();
+                        let pw = Zeroizing::new(self.su.import_pw.as_bytes().to_vec());
+                        self.spawn(ctx, Some("Decrypting import…"), move || {
+                            JobResult::ImportDecrypted(crypto::decrypt_export(&bytes, &pw).and_then(|pt| vault::parse_plain_export(&pt)))
                         });
                     }
-                }
-            });
-
-            // ── Export / Import
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "📦", "Export & import", "Back up every password and note");
-                ui.label(RichText::new("🔐 Encrypted export (.svx)").strong());
-                ui.label(RichText::new("Argon2id + XChaCha20-Poly1305 with a password you choose (you can reuse your master password).").size(12.0).color(p.weak));
-                w::text_input(ui, &mut self.su.export_pw, "Export password (12+ characters)", true);
-                w::text_input(ui, &mut self.su.export_pw2, "Confirm export password", true);
-                if let Some(b) = &self.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(b.as_str());
-                    });
-                } else if w::primary(ui, p, "Export encrypted…").clicked() {
-                    if self.su.export_pw.chars().count() < 12 {
-                        self.toast("Export password must be at least 12 characters", false);
-                    } else if *self.su.export_pw != *self.su.export_pw2 {
-                        self.toast("Export passwords don't match", false);
-                    } else if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name(format!("softvault-backup-{}.svx", chrono::Local::now().format("%Y-%m-%d")))
-                        .add_filter("SoftVault encrypted backup", &["svx"])
-                        .save_file()
-                    {
-                        match self.vault.export_json() {
-                            Ok(json) => {
-                                let pw = Zeroizing::new(self.su.export_pw.as_bytes().to_vec());
-                                self.spawn(&ctx, Some("Encrypting export…"), move || {
-                                    JobResult::Exported(crypto::encrypt_export(&json, &pw), path)
-                                });
-                            }
-                            Err(e) => self.toast(e.to_string(), false),
-                        }
-                    }
-                }
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(RichText::new("⚠ Unencrypted export (.json)").strong().color(p.warn));
-                ui.checkbox(&mut self.su.plain_ack, "I understand this file contains ALL my passwords and notes in plain text");
-                ui.add_enabled_ui(self.su.plain_ack, |ui| {
-                    if w::ghost(ui, p, "Export unencrypted…").clicked()
-                        && let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(format!("softvault-plaintext-{}.json", chrono::Local::now().format("%Y-%m-%d")))
-                            .add_filter("JSON", &["json"])
-                            .save_file()
-                        {
-                            match self.vault.export_json().and_then(|j| std::fs::write(&path, &*j).map_err(Into::into)) {
-                                Ok(()) => self.toast(format!("Plain export saved to {}", path.display()), true),
-                                Err(e) => self.toast(format!("Export failed: {e}"), false),
-                            }
-                            self.su.plain_ack = false;
-                        }
+                    ui.add_sized([ui.available_width(), 36.0], egui::TextEdit::singleline(&mut *self.su.import_pw).password(true).hint_text("File password").margin(Margin::symmetric(12, 9)));
                 });
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(RichText::new("📥 Import a SoftVault export").strong());
-                if self.su.import_bytes.is_some() {
-                    ui.label("This file is encrypted — enter its export password:");
-                    w::row_rtl(ui, |ui| {
-                        if w::ghost(ui, p, "Cancel").clicked() {
-                            self.su.import_bytes = None;
-                        }
-                        if self.busy.is_none() && w::primary(ui, p, "Decrypt & import").clicked() {
-                            let bytes = self.su.import_bytes.clone().unwrap();
-                            let pw = Zeroizing::new(self.su.import_pw.as_bytes().to_vec());
-                            self.spawn(&ctx, Some("Decrypting import…"), move || {
-                                JobResult::ImportDecrypted(crypto::decrypt_export(&bytes, &pw).and_then(|pt| vault::parse_plain_export(&pt)))
-                            });
-                        }
-                        ui.add_sized([ui.available_width(), 34.0], egui::TextEdit::singleline(&mut *self.su.import_pw).password(true).hint_text("Export password").margin(Margin::symmetric(12, 9)));
-                    });
-                } else if w::ghost(ui, p, "Choose file…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().add_filter("SoftVault export", &["svx", "json"]).pick_file() {
-                        match std::fs::read(&path) {
-                            Ok(bytes) if vault::is_encrypted_export(&bytes) => self.su.import_bytes = Some(bytes),
-                            Ok(bytes) => match vault::parse_plain_export(&bytes).and_then(|items| self.vault.import_items(items)) {
-                                Ok(n) => self.toast(format!("Imported {n} entries"), true),
-                                Err(e) => self.toast(format!("Import failed: {e}"), false),
-                            },
-                            Err(e) => self.toast(e.to_string(), false),
-                        }
-                    }
-            });
-
-            // ── About
-            card(ui, p, |ui| {
-                w::section_title(ui, p, "🛡", "Security model", "");
-                for line in [
-                    "• Zero-knowledge: your master password is never stored; only an authenticated ciphertext of a random vault key is kept.",
-                    "• Key derivation: Argon2id, 256 MiB memory, 3 iterations, 4 lanes, 256-bit random salt.",
-                    "• Encryption: XChaCha20-Poly1305 with a fresh 192-bit random nonce per record, bound to its record ID (AAD).",
-                    "• Titles, usernames, URLs, timestamps and item types are all encrypted — SQLite only sees random IDs and ciphertext.",
-                    "• Decrypted data is wiped from memory (zeroize) when the vault locks.",
-                ] {
-                    ui.label(RichText::new(line).size(12.5).color(p.weak));
+            } else if w::ghost(ui, p, &format!("{}  Choose file…", ic::FOLDER_OPEN)).clicked()
+                && let Some(path) = rfd::FileDialog::new().add_filter("SoftVault export", &["svx", "json"]).pick_file()
+            {
+                match std::fs::read(&path) {
+                    Ok(bytes) if vault::is_encrypted_export(&bytes) => self.su.import_bytes = Some(bytes),
+                    Ok(bytes) => match vault::parse_plain_export(&bytes).and_then(|e| self.vault.import_export(e)) {
+                        Ok((n, f)) => self.toast(format!("Imported {n} items and {f} files"), true),
+                        Err(e) => self.toast(format!("Import failed: {e}"), false),
+                    },
+                    Err(e) => self.toast(e.to_string(), false),
                 }
-                ui.label(RichText::new(format!("Database: {}", self.vault.path.display())).size(11.5).color(p.weak));
+            }
+        });
+    }
+
+    fn settings_about(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        card(ui, p, |ui| {
+            ui.horizontal(|ui| {
+                w::logo(ui, p, 48.0, false);
+                ui.add_space(6.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(w::h("SoftVault", 20.0));
+                    ui.label(RichText::new(format!("Version {} · zero-knowledge password & notes vault", env!("CARGO_PKG_VERSION"))).size(12.5).color(p.weak));
+                });
             });
-            ui.add_space(20.0);
+        });
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::SHIELD_CHECK, "Security model", "");
+            let rows = [
+                ("Zero-knowledge", "Your master password is never stored. Only an authenticated ciphertext of a random vault key is kept."),
+                ("Key derivation", "Argon2id: 256 MiB memory, 3 iterations, 4 lanes, 256-bit random salt."),
+                ("Encryption", "XChaCha20-Poly1305 with a fresh 192-bit nonce per record, bound to its record ID."),
+                ("Metadata", "Titles, usernames, URLs, timestamps and item types are all encrypted."),
+                ("Memory", "Decrypted data is wiped (zeroize) whenever the vault locks."),
+            ];
+            for (i, (t, d)) in rows.iter().enumerate() {
+                w::setting_row(ui, p, t, d, i == rows.len() - 1, |ui| {
+                    ui.label(RichText::new(ic::CIRCLE_CHECK).color(p.success).size(16.0));
+                });
+            }
+        });
+        card(ui, p, |ui| {
+            w::section_title(ui, p, ic::BOOK_OPEN, "Open-source components", "");
+            ui.label(RichText::new("Inter typeface (SIL OFL 1.1) · Lucide icons (ISC) · egui · SQLite · RustCrypto (Argon2, ChaCha20-Poly1305) · pulldown-cmark · syntect").size(12.5).color(p.weak));
         });
     }
 
     fn ui_toast(&mut self, ctx: &egui::Context, p: &Palette) {
-        if let Some(t) = &self.toast {
-            egui::Area::new(egui::Id::unique("softvault-toast"))
-                .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-22.0, -22.0))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    Frame::new()
-                        .fill(p.card)
-                        .stroke(Stroke::new(1.0, if t.ok { p.success } else { p.danger }))
-                        .corner_radius(CornerRadius::same(12))
-                        .inner_margin(Margin::symmetric(16, 12))
-                        .shadow(theme::soft_shadow(p))
-                        .show(ui, |ui| {
-                            ui.set_max_width(380.0);
-                            ui.label(RichText::new(format!("{}  {}", if t.ok { "✔" } else { "✖" }, t.text)).color(if t.ok { p.success } else { p.danger }));
+        // slide-in + fade
+        let born = self.undo.as_ref().map(|u| u.until - Duration::from_secs(UNDO_SECS)).or(self.toast.as_ref().map(|t| t.born));
+        let Some(born) = born else { return };
+        let t = (born.elapsed().as_secs_f32() / 0.22).min(1.0);
+        let ease = 1.0 - (1.0 - t).powi(3);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        let offset = Vec2::new(-24.0, -24.0 + (1.0 - ease) * 28.0);
+
+        let mut restore = false;
+        let mut dismiss_undo = false;
+        egui::Area::new(egui::Id::unique("softvault-toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, offset)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                ui.multiply_opacity(ease);
+                let frame = Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(theme::R_CARD)
+                    .inner_margin(Margin { left: 14, right: 14, top: 12, bottom: 12 })
+                    .shadow(theme::soft_shadow(p));
+                if let Some(u) = &self.undo {
+                    let resp = frame.show(ui, |ui| {
+                        ui.set_width(380.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 15.0, p.danger.gamma_multiply(if p.dark { 0.25 } else { 0.12 }));
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, ic::TRASH_2, egui::FontId::proportional(15.0), p.danger);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.add(egui::Label::new(w::h(format!("\u{201C}{}\u{201D} deleted", u.title), 13.5)).truncate());
+                                ui.label(RichText::new("It's gone from your vault.").size(12.5).color(p.weak));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if w::ghost_icon(ui, p, ic::X, "Dismiss").clicked() {
+                                    dismiss_undo = true;
+                                }
+                                if w::ghost(ui, p, &format!("{}  Undo", ic::ROTATE_CCW)).clicked() {
+                                    restore = true;
+                                }
+                            });
                         });
-                });
+                    });
+                    // countdown bar along the bottom edge
+                    let left = u.until.saturating_duration_since(Instant::now()).as_secs_f32() / UNDO_SECS as f32;
+                    let r = resp.response.rect;
+                    let bar = egui::Rect::from_min_size(egui::pos2(r.left() + 12.0, r.bottom() - 4.0), Vec2::new((r.width() - 24.0) * left, 2.5));
+                    ui.painter().rect_filled(bar, CornerRadius::same(2), p.danger.gamma_multiply(0.7));
+                    ctx.request_repaint_after(Duration::from_millis(30));
+                } else if let Some(t) = &self.toast {
+                    let tone = if t.ok { p.success } else { p.danger };
+                    frame.show(ui, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 15.0, tone.gamma_multiply(if p.dark { 0.25 } else { 0.14 }));
+                            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, if t.ok { ic::CHECK } else { ic::X }, egui::FontId::proportional(15.0), tone);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(w::h(if t.ok { "Done" } else { "Something went wrong" }, 13.5));
+                                ui.add(egui::Label::new(RichText::new(&t.text).size(13.0).color(p.weak)).wrap());
+                            });
+                        });
+                    });
+                }
+            });
+        if restore && let Some(u) = self.undo.take() {
+            match self.vault.save_item(Some(u.id.clone()), u.data.clone()) {
+                Ok(id) => {
+                    self.selected = Some(id);
+                    self.toast(format!("\u{201C}{}\u{201D} restored", u.title), true);
+                }
+                Err(e) => self.toast(format!("Restore failed: {e}"), false),
+            }
+        }
+        if dismiss_undo {
+            self.undo = None;
         }
     }
 }
 
 impl eframe::App for SoftVaultApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.applied_theme != Some(self.dark) {
             theme::apply(&ctx, self.dark);
@@ -1871,6 +2767,26 @@ impl eframe::App for SoftVaultApp {
             Screen::Mfa => self.ui_mfa(ui, &p),
             Screen::Main => self.ui_main(ui, &p),
         }
+
+        // ── drag & drop in: encrypt dropped files
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        if !dropped.is_empty() {
+            if self.screen == Screen::Main {
+                self.last_activity = Instant::now();
+                self.import_paths(dropped);
+            } else {
+                self.toast("Unlock your vault first, then drop the files again.", false);
+            }
+        }
+        if self.screen == Screen::Main {
+            self.ui_drop_overlay(&ctx, &p);
+            // ── drag & drop out: decrypted copy handed to the OS
+            self.process_drag_out(&ctx, frame);
+        }
         self.ui_toast(&ctx, &p);
+    }
+
+    fn on_exit(&mut self) {
+        self.temp.clear();
     }
 }

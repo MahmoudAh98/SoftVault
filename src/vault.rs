@@ -53,11 +53,22 @@ pub struct SecureSettings {
     pub mfa_last_step: u64,
     pub auto_lock_minutes: u32,
     pub clipboard_clear_secs: u32,
+    /// Drop zone: turn dropped .md/.txt/.json/.csv/code files into secure notes
+    pub import_text_as_notes: bool,
+    /// Drop zone: shred the original files after they were encrypted ("move")
+    pub move_originals: bool,
 }
 
 impl Default for SecureSettings {
     fn default() -> Self {
-        Self { mfa_secret: None, mfa_last_step: 0, auto_lock_minutes: 5, clipboard_clear_secs: 30 }
+        Self {
+            mfa_secret: None,
+            mfa_last_step: 0,
+            auto_lock_minutes: 5,
+            clipboard_clear_secs: 30,
+            import_text_as_notes: true,
+            move_originals: false,
+        }
     }
 }
 
@@ -69,6 +80,29 @@ pub struct Recovery {
     pub verified: bool,
 }
 
+/// Metadata of an encrypted file kept in the vault (content is stored separately).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Zeroize)]
+#[serde(default)]
+pub struct FileMeta {
+    pub name: String,
+    pub size: u64,
+    pub created: i64,
+}
+
+#[derive(Clone)]
+pub struct VaultFile {
+    pub id: String,
+    pub meta: FileMeta,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExportFile {
+    pub name: String,
+    pub created: i64,
+    /// base64 content
+    pub data: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PlainExport {
     pub format: String,
@@ -76,7 +110,12 @@ pub struct PlainExport {
     pub encrypted: bool,
     pub exported_at: String,
     pub items: Vec<ItemData>,
+    #[serde(default)]
+    pub files: Vec<ExportFile>,
 }
+
+/// Largest single file accepted into the vault.
+pub const MAX_FILE_BYTES: u64 = 200 * 1024 * 1024;
 
 pub struct UnlockMaterial {
     pub params: KdfParams,
@@ -86,14 +125,24 @@ pub struct UnlockMaterial {
 
 pub struct Vault {
     db: Db,
+    #[allow(dead_code)]
     pub path: PathBuf,
     key: Option<Key>,
     pub items: Vec<Item>,
+    pub files: Vec<VaultFile>,
     pub settings: SecureSettings,
 }
 
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn file_meta_aad(id: &str) -> Vec<u8> {
+    format!("softvault/v1/file-meta/{id}").into_bytes()
+}
+
+fn file_data_aad(id: &str) -> Vec<u8> {
+    format!("softvault/v1/file-data/{id}").into_bytes()
 }
 
 fn item_aad(id: &str) -> Vec<u8> {
@@ -104,12 +153,43 @@ fn new_id() -> String {
     crate::crypto::random_bytes::<16>().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn default_db_path() -> PathBuf {
+/// Where the database lives and how it got there.
+#[derive(Clone, Debug)]
+pub struct DbLocation {
+    pub path: PathBuf,
+    /// true = stored next to SoftVault.exe (portable; back up the whole folder)
+    pub portable: bool,
+}
+
+fn legacy_db_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("SoftVault").join("vault.db")
+}
+
+fn dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(".softvault-write-test");
+    let ok = std::fs::write(&probe, b"ok").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
+/// Portable-first: `vault.db` sits in the same folder as `SoftVault.exe`, so
+/// backing up that folder backs up everything. Falls back to %APPDATA% only if
+/// the exe folder is read-only (e.g. installed under Program Files).
+pub fn resolve_db_location() -> DbLocation {
+    let legacy = legacy_db_path();
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
+    let Some(dir) = exe_dir else {
+        return DbLocation { path: legacy, portable: false };
+    };
+    let portable = dir.join("vault.db");
+    if portable.exists() || dir_is_writable(&dir) {
+        return DbLocation { path: portable, portable: true };
+    }
+    DbLocation { path: legacy, portable: false }
 }
 
 impl Vault {
@@ -119,6 +199,7 @@ impl Vault {
             path: path.to_path_buf(),
             key: None,
             items: Vec::new(),
+            files: Vec::new(),
             settings: SecureSettings::default(),
         })
     }
@@ -174,8 +255,15 @@ impl Vault {
             let data: ItemData = serde_json::from_slice(&pt)?;
             items.push(Item { id, data });
         }
+        let mut files = Vec::new();
+        for (id, blob) in self.db.load_file_metas()? {
+            let pt = crypto::open(&key, &blob, &file_meta_aad(&id)).map_err(|_| anyhow!("file {id} failed authentication (tampered?)"))?;
+            let meta: FileMeta = serde_json::from_slice(&pt)?;
+            files.push(VaultFile { id, meta });
+        }
         self.settings = settings;
         self.items = items;
+        self.files = files;
         self.key = Some(key);
         Ok(())
     }
@@ -185,6 +273,10 @@ impl Vault {
             it.data.zeroize();
         }
         self.items.clear();
+        for f in self.files.iter_mut() {
+            f.meta.zeroize();
+        }
+        self.files.clear();
         self.settings.zeroize();
         self.settings = SecureSettings::default();
         self.key = None; // Zeroizing wipes the key on drop
@@ -217,6 +309,37 @@ impl Vault {
         Ok(id)
     }
 
+    /// Encrypt `bytes` and store them as a vault file.
+    pub fn add_file(&mut self, name: &str, bytes: &[u8], created: Option<i64>) -> Result<String> {
+        if bytes.len() as u64 > MAX_FILE_BYTES {
+            return Err(anyhow!("{name} is larger than {} MB", MAX_FILE_BYTES / 1024 / 1024));
+        }
+        let id = new_id();
+        let meta = FileMeta { name: name.to_string(), size: bytes.len() as u64, created: created.unwrap_or_else(now_ts) };
+        let key = self.key()?;
+        let meta_blob = crypto::seal(key, &Zeroizing::new(serde_json::to_vec(&meta)?), &file_meta_aad(&id))?;
+        let data_blob = crypto::seal(key, bytes, &file_data_aad(&id))?;
+        self.db.insert_file(&id, &meta_blob, &data_blob)?;
+        self.files.push(VaultFile { id: id.clone(), meta });
+        Ok(id)
+    }
+
+    /// Decrypt a vault file's content.
+    pub fn read_file(&self, id: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let blob = self.db.load_file_data(id)?;
+        crypto::open(self.key()?, &blob, &file_data_aad(id)).map_err(|_| anyhow!("file failed authentication (tampered?)"))
+    }
+
+    pub fn delete_file(&mut self, id: &str) -> Result<()> {
+        self.key()?;
+        self.db.delete_file(id)?;
+        if let Some(pos) = self.files.iter().position(|f| f.id == id) {
+            let mut f = self.files.remove(pos);
+            f.meta.zeroize();
+        }
+        Ok(())
+    }
+
     pub fn delete_item(&mut self, id: &str) -> Result<()> {
         self.key()?;
         self.db.delete_item(id)?;
@@ -244,6 +367,11 @@ impl Vault {
 
     pub fn set_protected(&self, key: &str, value: &[u8]) -> Result<()> {
         self.db.set_meta(key, &protect::protect(value)?)
+    }
+
+    /// Consistent snapshot of the whole (encrypted) database into `dest`.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        self.db.backup_to(dest)
     }
 
     pub fn delete_meta(&self, key: &str) -> Result<()> {
@@ -284,27 +412,41 @@ impl Vault {
             encrypted: false,
             exported_at: chrono::Local::now().to_rfc3339(),
             items: self.items.iter().map(|i| i.data.clone()).collect(),
+            files: self
+                .files
+                .iter()
+                .map(|f| -> Result<ExportFile> {
+                    use base64::{engine::general_purpose::STANDARD, Engine};
+                    Ok(ExportFile { name: f.meta.name.clone(), created: f.meta.created, data: STANDARD.encode(&*self.read_file(&f.id)?) })
+                })
+                .collect::<Result<_>>()?,
         };
         Ok(Zeroizing::new(serde_json::to_vec_pretty(&e)?))
     }
 
-    pub fn import_items(&mut self, items: Vec<ItemData>) -> Result<usize> {
-        let n = items.len();
-        for mut d in items {
+    /// Import an export: returns (items, files) added.
+    pub fn import_export(&mut self, e: PlainExport) -> Result<(usize, usize)> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (n_items, n_files) = (e.items.len(), e.files.len());
+        for mut d in e.items {
             d.created = if d.created == 0 { now_ts() } else { d.created };
             self.save_item(None, d)?;
         }
-        Ok(n)
+        for f in e.files {
+            let bytes = Zeroizing::new(STANDARD.decode(f.data.as_bytes())?);
+            self.add_file(&f.name, &bytes, Some(f.created))?;
+        }
+        Ok((n_items, n_files))
     }
 }
 
 /// Parse a plaintext export (or the decrypted inner payload of an encrypted one).
-pub fn parse_plain_export(bytes: &[u8]) -> Result<Vec<ItemData>> {
+pub fn parse_plain_export(bytes: &[u8]) -> Result<PlainExport> {
     let e: PlainExport = serde_json::from_slice(bytes).context("not a SoftVault export file")?;
     if e.format != "softvault" {
         return Err(anyhow!("not a SoftVault export file"));
     }
-    Ok(e.items)
+    Ok(e)
 }
 
 pub fn is_encrypted_export(bytes: &[u8]) -> bool {
@@ -339,7 +481,7 @@ mod tests {
         let enc = crypto::encrypt_export(&plain, b"export-password-123").unwrap();
         assert!(is_encrypted_export(&enc));
         let back = parse_plain_export(&crypto::decrypt_export(&enc, b"export-password-123").unwrap()).unwrap();
-        assert_eq!(back.len(), 2);
+        assert_eq!(back.items.len(), 2);
         assert!(crypto::decrypt_export(&enc, b"wrong").is_err());
 
         v.lock();
@@ -359,6 +501,38 @@ mod tests {
         let m = v.unlock_material().unwrap();
         let k = crypto::unwrap_vault_key(b"correct horse battery", &m.params, &m.salt, &m.wrapped).unwrap();
         assert!(v.finish_unlock(k).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_roundtrip_lock_and_tamper() {
+        let dir = std::env::temp_dir().join(format!("sv-files-{}", now_ts()));
+        let path = dir.join("vault.db");
+        let mut v = Vault::open(&path).unwrap();
+        v.finish_create(crypto::build_new_vault(b"correct horse battery").unwrap()).unwrap();
+        let payload = b"%PDF-1.7 secret contract".to_vec();
+        let id = v.add_file("contract.pdf", &payload, None).unwrap();
+        assert_eq!(&*v.read_file(&id).unwrap(), &payload[..]);
+        // name and content are not visible on disk
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(8).any(|w| w == b"contract"));
+        // survives lock/unlock
+        v.lock();
+        assert!(v.files.is_empty());
+        let m = v.unlock_material().unwrap();
+        let k = crypto::unwrap_vault_key(b"correct horse battery", &m.params, &m.salt, &m.wrapped).unwrap();
+        v.finish_unlock(k).unwrap();
+        assert_eq!(v.files.len(), 1);
+        assert_eq!(v.files[0].meta.name, "contract.pdf");
+        // exports carry files
+        let e = parse_plain_export(&v.export_json().unwrap()).unwrap();
+        assert_eq!(e.files.len(), 1);
+        // tampering with the ciphertext is detected
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE files SET data = meta WHERE id = ?1", [&id]).unwrap();
+        assert!(v.read_file(&id).is_err());
+        v.delete_file(&id).unwrap();
+        assert!(v.files.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

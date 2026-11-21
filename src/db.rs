@@ -27,6 +27,11 @@ impl Db {
              CREATE TABLE IF NOT EXISTS items (
                  id   TEXT PRIMARY KEY,
                  blob BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS files (
+                 id   TEXT PRIMARY KEY,
+                 meta BLOB NOT NULL,
+                 data BLOB NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -70,6 +75,39 @@ impl Db {
 
     pub fn delete_item(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn load_file_metas(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut st = self.conn.prepare("SELECT id, meta FROM files")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn load_file_data(&self, id: &str) -> Result<Vec<u8>> {
+        Ok(self.conn.query_row("SELECT data FROM files WHERE id = ?1", params![id], |r| r.get(0))?)
+    }
+
+    pub fn insert_file(&self, id: &str, meta: &[u8], data: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO files(id, meta, data) VALUES(?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET meta = excluded.meta, data = excluded.data",
+            params![id, meta, data],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_file(&self, id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// `VACUUM INTO` produces a consistent, compact copy even while the app is running.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        if dest.exists() {
+            std::fs::remove_file(dest)?;
+        }
+        self.conn.execute("VACUUM INTO ?1", params![dest.to_string_lossy()])?;
         Ok(())
     }
 

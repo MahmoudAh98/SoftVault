@@ -29,6 +29,15 @@ SoftVault is an independent project. It is not affiliated with Bitwarden and use
   - **unencrypted** `.json`, which asks you to confirm before it saves
 - **Import** from either format.
 - **Auto-lock** after a period of inactivity, and **clipboard auto-clear** after you copy.
+- **Drag & drop encryption (Secure files).**
+  - **Drag in:** drop files or folders anywhere on the window and they're encrypted into the vault with your vault key (XChaCha20-Poly1305, with the name and content encrypted separately). Text files (`.md .txt .json .csv` and code) become **secure notes** in the matching format. Everything else (PDFs, images, keys, archives, up to 200 MB each) is stored under **Secure files**.
+  - **Drag out (Windows):** drag a file card, or a note in the vault list, out to Explorer or the desktop to get a **decrypted** copy. SoftVault writes it to a private temp folder for Windows' native drag, then overwrites and deletes that temp copy after 2 minutes (and immediately on lock or exit). **Save decrypted…** does the same through a save dialog.
+  - **Move mode (optional):** securely delete the original files after they've been encrypted. They are overwritten with zeros first; SSDs may still keep old blocks.
+  - Files are included in exports and backups, and survive lock and unlock.
+- **Safe, animated delete.** Deleting takes two clicks on an animated recycle bin: the lid lifts on hover, and the first click arms it (it turns red and wiggles). The second click drops the item in and closes the lid. An **Undo** toast then lets you restore the item for 10 seconds.
+- **Motion:** pages and dialogs fade in, toasts slide in, and the sidebar and table rows fade on hover.
+- **Vault health:** a health score and lists of weak, reused and old passwords, each with a **Fix** button.
+- **Productive UI:** Lucide icons, sortable columns, quick actions when you hover a row (copy username or password, open website), a right-click menu, tabbed settings, an auto-lock countdown, and keyboard shortcuts (Ctrl+F, Ctrl+N, Ctrl+Shift+N, Ctrl+L, Ctrl+S, Esc).
 - Per-login **2FA codes** (optional): store a site's TOTP secret and get live codes.
 
 ## Security model
@@ -56,9 +65,13 @@ Some honest notes:
 3. In SoftVault, open **Settings → Password hint & recovery Gmail**, enter your Gmail address and the app password, click **Send verification code**, then enter the code from the email.
 4. Set your hint. On the lock screen, **Forgot your password? → Email my hint** sends it through `smtp.gmail.com:465` (TLS), from your Gmail to your Gmail.
 
-## Data location
+## Data location (portable)
 
-`%APPDATA%\SoftVault\vault.db`
+The vault is stored as **`vault.db` in the same folder as `SoftVault.exe`**, so backing up that folder backs up everything. The database is fully encrypted.
+
+- If the exe's folder is read-only (for example under `Program Files`), SoftVault falls back to `%APPDATA%\SoftVault\vault.db`.
+- **Settings → Backup & storage** shows the exact path, has an **Open folder** button, and can make a consistent **Back up now** copy while the app is running.
+- The Gmail recovery settings and the hint are protected with Windows DPAPI, so they only work for the same Windows account. On another PC your vault still opens with the master password; you just set up recovery again.
 
 ## Build
 
@@ -82,7 +95,7 @@ cargo build --release
 ## Project layout
 
 ```
-assets/fonts/  Inter (SIL Open Font License, see Inter-LICENSE.txt)
+assets/fonts/  Inter (SIL OFL) and a Lucide icon subset (ISC); licenses included
 src/
   main.rs       window setup and icon
   app.rs        all screens: setup / unlock / 2FA / vault / settings
@@ -92,8 +105,10 @@ src/
   vault.rs      vault logic and in-memory state (zeroized on lock)
   db.rs         SQLite storage (ciphertext only)
   render.rs     note rendering: Markdown, code highlighting, JSON tree, CSV table
+  transfer.rs   drag & drop in/out, temp-copy shredding, native Windows drag source
   totp.rs       RFC 6238 TOTP (tested against RFC 4226 vectors)
   mailer.rs     Gmail SMTP (rustls)
   protect.rs    Windows DPAPI wrapper
   generator.rs  CSPRNG password generator and strength estimate
+  icons.rs      Lucide icon codepoints
 ```
