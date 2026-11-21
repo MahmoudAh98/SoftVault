@@ -549,6 +549,15 @@ impl Vault {
         self.db.set_meta(key, &protect::protect(value)?)
     }
 
+    /// (database size, reclaimable bytes)
+    pub fn db_stats(&self) -> Result<(u64, u64)> {
+        self.db.stats()
+    }
+
+    pub fn compact(&self) -> Result<()> {
+        self.db.compact()
+    }
+
     /// Consistent snapshot of the whole (encrypted) database into `dest`.
     pub fn backup_to(&self, dest: &Path) -> Result<()> {
         self.db.backup_to(dest)
@@ -800,6 +809,13 @@ mod tests {
         assert!(v.read_file(&id).is_err());
         v.delete_file(&id).unwrap();
         assert!(v.files.is_empty());
+
+        // auto-vacuum: deleting a large file gives the space back
+        let big = v.add_file("big.bin", &vec![1u8; 3_000_000], None).unwrap();
+        let with = std::fs::metadata(&path).unwrap().len();
+        v.delete_file(&big).unwrap();
+        let without = std::fs::metadata(&path).unwrap().len();
+        assert!(without + 2_500_000 < with, "db should shrink: {with} -> {without}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

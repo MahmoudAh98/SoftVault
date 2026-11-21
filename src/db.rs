@@ -16,6 +16,13 @@ impl Db {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
+        // auto_vacuum = FULL makes SQLite give freed pages back to the OS on every
+        // commit, so deleting files actually shrinks vault.db. The mode must be set
+        // before the first table exists, or applied to an existing file with VACUUM.
+        let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+        if mode != 1 {
+            conn.execute_batch("PRAGMA auto_vacuum = FULL; VACUUM;")?;
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = DELETE;
              PRAGMA secure_delete = ON;
@@ -104,6 +111,20 @@ impl Db {
 
     pub fn delete_file(&self, id: &str) -> Result<()> {
         self.conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// (file size in bytes, reclaimable free bytes)
+    pub fn stats(&self) -> Result<(u64, u64)> {
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let pages: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let free: i64 = self.conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        Ok(((pages * page_size) as u64, (free * page_size) as u64))
+    }
+
+    /// Rebuild the database file compactly (also defragments it).
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
         Ok(())
     }
 

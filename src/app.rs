@@ -810,9 +810,8 @@ impl SoftVaultApp {
                     count,
                     false,
                 );
-                // drag folders onto other folders to nest them
-                let drag_r = ui.interact(r.rect, fid.with("drag"), egui::Sense::drag());
-                drag_r.dnd_set_drag_payload(DragRef::Folder(folder.id.clone()));
+                // drag folders onto other folders to nest them (same response as the click)
+                r.dnd_set_drag_payload(DragRef::Folder(folder.id.clone()));
                 let target = hover_payload && r.contains_pointer();
                 if target {
                     ui.painter().rect_stroke(r.rect, theme::R_INPUT, Stroke::new(1.5, p.nav_text), egui::StrokeKind::Inside);
@@ -824,7 +823,7 @@ impl SoftVaultApp {
                         }
                     }
                 }
-                if let Some(pl) = drag_r.dnd_release_payload::<DragRef>().or_else(|| r.dnd_release_payload::<DragRef>()) {
+                if let Some(pl) = r.dnd_release_payload::<DragRef>() {
                     self.move_to_folder(&pl, Some(folder.id.clone()));
                 }
                 if chev {
@@ -833,7 +832,7 @@ impl SoftVaultApp {
                     } else {
                         self.expanded.insert(folder.id.clone());
                     }
-                } else if r.clicked() || drag_r.clicked() {
+                } else if r.clicked() {
                     self.folder_filter = Some(folder.id.clone());
                     if self.view != View::Files {
                         self.view = View::All;
@@ -1466,6 +1465,7 @@ impl SoftVaultApp {
                                 updated: &date,
                                 selected: sel,
                                 drop_target: false,
+                                query: &self.search,
                             },
                         );
                         // drag onto a sidebar folder to move, or out of the window to export (notes)
@@ -3126,6 +3126,23 @@ impl SoftVaultApp {
             if loc.portable {
                 ui.label(RichText::new(format!("{}  Back up the whole folder to back up everything. The file is fully encrypted. Your Gmail recovery settings are tied to this Windows account; on another PC, just set them up again.", ic::INFO)).size(12.5).color(p.weak));
             }
+            let (size, free) = self.vault.db_stats().unwrap_or((0, 0));
+            let desc = format!(
+                "vault.db is {}. Space from deleted items is returned automatically{}.",
+                transfer::human_size(size),
+                if free > 0 { format!("; {} can be reclaimed now", transfer::human_size(free)) } else { String::new() }
+            );
+            w::setting_row(ui, p, "Database size", &desc, false, |ui| {
+                if w::ghost(ui, p, &format!("{}  Compact now", ic::MINIMIZE_2)).on_hover_text("Rebuild vault.db as small as possible").clicked() {
+                    match self.vault.compact() {
+                        Ok(()) => {
+                            let after = self.vault.db_stats().map(|s| s.0).unwrap_or(size);
+                            self.toast(format!("Database compacted: {} → {}", transfer::human_size(size), transfer::human_size(after)), true);
+                        }
+                        Err(e) => self.toast(format!("Compact failed: {e}"), false),
+                    }
+                }
+            });
             w::setting_row(ui, p, "Back up database now", "Save an encrypted copy of vault.db. Restore it by placing it next to SoftVault.exe.", true, |ui| {
                 if w::primary(ui, p, &format!("{}  Back up…", ic::SAVE)).clicked()
                     && let Some(path) = rfd::FileDialog::new()

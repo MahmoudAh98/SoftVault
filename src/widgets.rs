@@ -386,13 +386,92 @@ pub fn table_header(ui: &mut Ui, p: &Palette, sort: (SortCol, bool)) -> Option<S
 }
 
 /// A small rounded tag pill; returns its width.
-pub fn paint_tag(painter: &egui::Painter, pos: egui::Pos2, tag: &str, p: &Palette) -> f32 {
-    let col = avatar_color(tag);
-    let g = painter.layout_no_wrap(format!("#{tag}"), FontId::proportional(11.0), if p.dark { lerp(col, Color32::WHITE, 0.45) } else { col });
-    let r = Rect::from_min_size(pos, g.size() + Vec2::new(12.0, 4.0));
-    painter.rect_filled(r, PILL, col.gamma_multiply(if p.dark { 0.28 } else { 0.12 }));
-    painter.galley(r.min + Vec2::new(6.0, 2.0), g, Color32::WHITE);
+/// Stable, pleasant color per tag name.
+pub fn tag_color(tag: &str) -> Color32 {
+    const COLS: [Color32; 10] = [
+        Color32::from_rgb(0x25, 0x63, 0xeb), // blue
+        Color32::from_rgb(0x05, 0x96, 0x69), // emerald
+        Color32::from_rgb(0xd9, 0x77, 0x06), // amber
+        Color32::from_rgb(0xe1, 0x1d, 0x48), // rose
+        Color32::from_rgb(0x7c, 0x3a, 0xed), // violet
+        Color32::from_rgb(0x0d, 0x94, 0x88), // teal
+        Color32::from_rgb(0xea, 0x58, 0x0c), // orange
+        Color32::from_rgb(0x02, 0x84, 0xc7), // sky
+        Color32::from_rgb(0xdb, 0x27, 0x77), // pink
+        Color32::from_rgb(0x65, 0xa3, 0x0d), // lime
+    ];
+    let h = tag.bytes().fold(2166136261u32, |a, b| (a ^ b as u32).wrapping_mul(16777619));
+    COLS[(h % COLS.len() as u32) as usize]
+}
+
+/// (background, text) colors of a tag pill for the current theme.
+pub fn tag_colors(tag: &str, p: &Palette) -> (Color32, Color32) {
+    let c = tag_color(tag);
+    if p.dark {
+        (c.gamma_multiply(0.30), lerp(c, Color32::WHITE, 0.55))
+    } else {
+        (lerp(c, Color32::WHITE, 0.86), lerp(c, Color32::BLACK, 0.25))
+    }
+}
+
+/// Colored tag pill (dot + name); returns its width. `hit` = matches the search.
+pub fn paint_tag(painter: &egui::Painter, pos: egui::Pos2, tag: &str, p: &Palette, hit: bool) -> f32 {
+    let (bg, fg) = tag_colors(tag, p);
+    let g = painter.layout_no_wrap(tag.to_string(), FontId::new(11.5, semibold()), fg);
+    let r = Rect::from_min_size(pos, Vec2::new(g.size().x + 26.0, 20.0));
+    painter.rect_filled(r, CornerRadius::same(10), bg);
+    if hit {
+        painter.rect_stroke(r, CornerRadius::same(10), Stroke::new(1.5, p.warn), StrokeKind::Outside);
+    }
+    painter.circle_filled(egui::pos2(r.left() + 10.0, r.center().y), 3.5, tag_color(tag));
+    painter.galley(egui::pos2(r.left() + 18.0, r.center().y - g.size().y / 2.0), g, fg);
     r.width()
+}
+
+/// Character ranges (as byte ranges) where `needle` occurs in `hay`, case-insensitively.
+pub fn find_matches(hay: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let needle = needle.trim().trim_start_matches('#').to_lowercase();
+    if needle.is_empty() {
+        return vec![];
+    }
+    let lower: Vec<(usize, char)> = hay.char_indices().flat_map(|(i, c)| c.to_lowercase().map(move |l| (i, l))).collect();
+    let nd: Vec<char> = needle.chars().collect();
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k + nd.len() <= lower.len() {
+        if lower[k..k + nd.len()].iter().map(|x| x.1).eq(nd.iter().copied()) {
+            let start = lower[k].0;
+            let last = lower[k + nd.len() - 1].0;
+            let end = last + hay[last..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            if out.last().is_none_or(|r: &std::ops::Range<usize>| r.end <= start) {
+                out.push(start..end);
+            }
+            k += nd.len();
+        } else {
+            k += 1;
+        }
+    }
+    out
+}
+
+/// Text with search matches highlighted (marker-pen style).
+pub fn highlighted(text: &str, query: &str, font: FontId, color: Color32, p: &Palette) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let normal = egui::TextFormat { font_id: font.clone(), color, ..Default::default() };
+    let hl_bg = if p.dark { Color32::from_rgba_unmultiplied(0xfa, 0xcc, 0x15, 90) } else { Color32::from_rgb(0xfe, 0xf0, 0x8a) };
+    let hl = egui::TextFormat { font_id: font, color: if p.dark { Color32::WHITE } else { Color32::from_rgb(0x1b, 0x20, 0x29) }, background: hl_bg, ..Default::default() };
+    let mut pos = 0;
+    for r in find_matches(text, query) {
+        if r.start > pos {
+            job.append(&text[pos..r.start], 0.0, normal.clone());
+        }
+        job.append(&text[r.clone()], 0.0, hl.clone());
+        pos = r.end;
+    }
+    if pos < text.len() {
+        job.append(&text[pos..], 0.0, normal);
+    }
+    job
 }
 
 pub struct RowData<'a> {
@@ -408,12 +487,19 @@ pub struct RowData<'a> {
     pub updated: &'a str,
     pub selected: bool,
     pub drop_target: bool,
+    /// current search text (matches get highlighted)
+    pub query: &'a str,
+}
+
+/// Row height: taller when the item has tags (they get their own line).
+pub fn row_height(has_tags: bool) -> f32 {
+    if has_tags { 80.0 } else { 58.0 }
 }
 
 /// One table row; returns the row response and the rect reserved for the options button.
 /// Rows are click-and-drag: drag onto a folder to move, or out of the window to export.
 pub fn table_row(ui: &mut Ui, p: &Palette, d: &RowData) -> (Response, Rect) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_height(!d.tags.is_empty())), Sense::click_and_drag());
     let c = cols(rect);
     let hovered = ui.rect_contains_pointer(rect);
     let painter = ui.painter();
@@ -435,23 +521,36 @@ pub fn table_row(ui: &mut Ui, p: &Palette, d: &RowData) -> (Response, Rect) {
     let glyph = if d.note { d.note_icon.to_string() } else { d.title.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into()) };
     painter.text(icp, Align2::CENTER_CENTER, glyph, FontId::new(if d.note { 15.0 } else { 13.5 }, semibold()), if p.dark { lerp(col, Color32::WHITE, 0.35) } else { col });
 
-    // name + favorite + subtitle + tags
+    // name (+favorite), then tags on their own line, then subtitle — search matches highlighted
     let name_w = (c.folder - c.name - 16.0).max(60.0);
     let max_chars = (name_w / 7.2) as usize;
     let t = if d.title.is_empty() { "(untitled)" } else { d.title };
-    let tg = painter.layout_no_wrap(truncate(t, max_chars.saturating_sub(if d.favorite { 2 } else { 0 })), FontId::new(14.0, semibold()), p.accent);
+    let has_tags = !d.tags.is_empty();
+    let top = rect.top() + if has_tags { 9.0 } else { 11.0 };
+    let title = truncate(t, max_chars.saturating_sub(if d.favorite { 2 } else { 0 }));
+    let tg = painter.layout_job(highlighted(&title, d.query, FontId::new(14.0, semibold()), p.accent, p));
     let tw = tg.size().x;
-    painter.galley(egui::pos2(c.name, rect.center().y - 17.0), tg, p.accent);
+    painter.galley(egui::pos2(c.name, top), tg, p.accent);
     if d.favorite {
-        painter.text(egui::pos2(c.name + tw + 6.0, rect.center().y - 9.5), Align2::LEFT_CENTER, ic::STAR, FontId::proportional(12.0), p.warn);
+        painter.text(egui::pos2(c.name + tw + 6.0, top + 9.0), Align2::LEFT_CENTER, ic::STAR, FontId::proportional(12.0), p.warn);
     }
-    let sub_g = painter.layout_no_wrap(truncate(d.subtitle, (max_chars / 2).max(12)), FontId::proportional(12.5), p.weak);
-    let sub_w = if d.subtitle.is_empty() { 0.0 } else { sub_g.size().x + 8.0 };
-    painter.galley(egui::pos2(c.name, rect.center().y + 2.0), sub_g, p.weak);
-    let mut x = c.name + sub_w;
-    let clip = painter.with_clip_rect(Rect::from_min_max(egui::pos2(c.name, rect.top()), egui::pos2(c.folder - 10.0, rect.bottom())));
-    for tag in d.tags.iter().take(4) {
-        x += paint_tag(&clip, egui::pos2(x, rect.center().y + 2.0), tag, p) + 4.0;
+    let mut y = top + 21.0;
+    if has_tags {
+        let clip = painter.with_clip_rect(Rect::from_min_max(egui::pos2(c.name, rect.top()), egui::pos2(c.folder - 10.0, rect.bottom())));
+        let mut x = c.name;
+        for tag in d.tags.iter().take(6) {
+            let hit = !find_matches(tag, d.query).is_empty();
+            x += paint_tag(&clip, egui::pos2(x, y), tag, p, hit) + 5.0;
+        }
+        if d.tags.len() > 6 {
+            clip.text(egui::pos2(x + 2.0, y + 10.0), Align2::LEFT_CENTER, format!("+{}", d.tags.len() - 6), FontId::proportional(11.5), p.weak);
+        }
+        y += 25.0;
+    }
+    if !d.subtitle.is_empty() {
+        let sub = truncate(d.subtitle, max_chars + 6);
+        let sg = painter.layout_job(highlighted(&sub, d.query, FontId::proportional(12.5), p.weak, p));
+        painter.galley(egui::pos2(c.name, y), sg, p.weak);
     }
 
     // folder
@@ -692,7 +791,8 @@ pub fn file_card(ui: &mut Ui, p: &Palette, id: egui::Id, icon: &str, tone: Color
     painter.text(r.right_top() + Vec2::new(-16.0, 24.0), Align2::CENTER_CENTER, ic::GRIP_VERTICAL, FontId::proportional(14.0), p.weak.gamma_multiply(0.4 + 0.6 * ht));
     let max_chars = ((r.width() - 32.0) / 7.4) as usize;
     painter.text(egui::pos2(r.left() + 16.0, tile.bottom() + 18.0), Align2::LEFT_CENTER, truncate(name, max_chars), FontId::new(14.0, semibold()), p.text);
-    painter.text(egui::pos2(r.left() + 16.0, tile.bottom() + 38.0), Align2::LEFT_CENTER, info, FontId::proportional(12.0), p.weak);
+    let info_y = if tags.is_empty() { tile.bottom() + 38.0 } else { tile.bottom() + 62.0 };
+    painter.text(egui::pos2(r.left() + 16.0, info_y), Align2::LEFT_CENTER, info, FontId::proportional(12.0), p.weak);
     // folder badge (top-right of the tile row)
     if !folder.is_empty() {
         let fg = painter.layout_no_wrap(format!("{}  {}", ic::FOLDER, truncate(folder, 18)), FontId::proportional(11.5), p.weak);
@@ -702,7 +802,7 @@ pub fn file_card(ui: &mut Ui, p: &Palette, id: egui::Id, icon: &str, tone: Color
     let clip = painter.with_clip_rect(Rect::from_min_max(egui::pos2(r.left() + 12.0, r.top()), egui::pos2(r.right() - 12.0, r.bottom())));
     let mut x = r.left() + 16.0;
     for t in tags.iter().take(5) {
-        x += paint_tag(&clip, egui::pos2(x, tile.bottom() + 52.0), t, p) + 4.0;
+        x += paint_tag(&clip, egui::pos2(x, tile.bottom() + 30.0), t, p, false) + 5.0;
     }
     let actions = Rect::from_min_max(egui::pos2(r.left() + 8.0, r.bottom() - 42.0), egui::pos2(r.right() - 8.0, r.bottom() - 6.0));
     (resp.on_hover_cursor(if hovered { egui::CursorIcon::Grab } else { egui::CursorIcon::Default }), actions)
@@ -713,7 +813,7 @@ pub fn file_card(ui: &mut Ui, p: &Palette, id: egui::Id, icon: &str, tone: Color
 #[allow(clippy::too_many_arguments)]
 pub fn tree_item(ui: &mut Ui, p: &Palette, id: egui::Id, name: &str, depth: usize, expanded: Option<bool>, selected: bool, count: usize, drop_hover: bool) -> (Response, bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
-    let resp = ui.interact(rect, id, Sense::click());
+    let resp = ui.interact(rect, id, Sense::click_and_drag());
     let ht = ui.ctx().animate_bool_with_time(id.with("hover"), resp.hovered() || drop_hover, 0.12);
     let painter = ui.painter();
     let mut bg = lerp(Color32::TRANSPARENT, p.nav_hover, ht);
@@ -752,7 +852,7 @@ pub fn tag_nav_item(ui: &mut Ui, p: &Palette, tag: &str, selected: bool, count: 
     let bg = if selected { p.nav_active } else { lerp(Color32::TRANSPARENT, p.nav_hover, ht) };
     painter.rect_filled(rect, R_INPUT, bg);
     let col = if selected { p.nav_active_text } else { p.nav_text };
-    painter.circle_filled(egui::pos2(rect.left() + 18.0, rect.center().y), 4.5, avatar_color(tag));
+    painter.circle_filled(egui::pos2(rect.left() + 18.0, rect.center().y), 4.5, tag_color(tag));
     painter.text(egui::pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, format!("#{tag}"), FontId::proportional(13.0), col);
     painter.text(rect.right_center() - Vec2::new(12.0, 0.0), Align2::RIGHT_CENTER, count.to_string(), FontId::proportional(11.5), if selected { col } else { p.nav_weak });
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -768,10 +868,10 @@ pub fn tag_editor(ui: &mut Ui, p: &Palette, id_salt: &str, tags: &mut Vec<String
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
         let mut remove = None;
         for (i, t) in tags.iter().enumerate() {
-            let col = avatar_color(t);
-            let txt = RichText::new(format!("#{t}  {}", ic::X)).size(12.5).color(if p.dark { lerp(col, Color32::WHITE, 0.45) } else { col });
+            let (bg, fg) = tag_colors(t, p);
+            let txt = RichText::new(format!("{t}   {}", ic::X)).size(12.5).color(fg).family(semibold());
             if ui
-                .add(egui::Button::new(txt).fill(col.gamma_multiply(if p.dark { 0.28 } else { 0.12 })).stroke(Stroke::NONE).corner_radius(PILL).min_size(Vec2::new(0.0, 26.0)))
+                .add(egui::Button::new(txt).fill(bg).stroke(Stroke::NONE).corner_radius(PILL).min_size(Vec2::new(0.0, 26.0)))
                 .on_hover_text("Remove tag")
                 .clicked()
             {
@@ -810,4 +910,18 @@ pub fn tag_editor(ui: &mut Ui, p: &Palette, id_salt: &str, tags: &mut Vec<String
     });
     ui.ctx().data_mut(|d| d.insert_temp(input_id, input));
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_matches;
+    #[test]
+    fn matches_are_case_insensitive_and_utf8_safe() {
+        assert_eq!(find_matches("GitHub github", "hub"), vec![3..6, 10..13]);
+        assert_eq!(find_matches("Prod server", "#PROD"), vec![0..4]);
+        let s = "Café crème";
+        let r = find_matches(s, "crè");
+        assert_eq!(&s[r[0].clone()], "crè");
+        assert!(find_matches("abc", "").is_empty());
+    }
 }

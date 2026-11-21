@@ -73,6 +73,7 @@ Some honest notes:
 The vault is stored as **`vault.db` in the same folder as `SoftVault.exe`**, so backing up that folder backs up everything. The database is fully encrypted.
 
 - If the exe's folder is read-only (for example under `Program Files`), SoftVault falls back to `%APPDATA%\SoftVault\vault.db`.
+- The database uses SQLite `auto_vacuum = FULL`, so deleting items or files shrinks `vault.db` straight away (freed pages are also zeroed with `secure_delete`). Older vaults are converted automatically the first time they're opened. **Settings → Backup & storage** shows the current size and has a **Compact now** button.
 - **Settings → Backup & storage** shows the exact path, has an **Open folder** button, and can make a consistent **Back up now** copy while the app is running.
 - The Gmail recovery settings and the hint are protected with Windows DPAPI, so they only work for the same Windows account. On another PC your vault still opens with the master password; you just set up recovery again.
 
