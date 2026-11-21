@@ -1,0 +1,67 @@
+name: Build Windows (.exe)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed only to attach the .exe to a GitHub Release on tags
+
+env:
+  CARGO_TERM_COLOR: always
+  # Static CRT -> the .exe runs without installing the VC++ redistributable
+  RUSTFLAGS: "-C target-feature=+crt-static"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release --target x86_64-pc-windows-msvc
+
+      - name: Build release
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/softvault.exe dist/SoftVault.exe
+          $h = (Get-FileHash dist/SoftVault.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  SoftVault.exe" | Out-File -Encoding ascii dist/SoftVault.exe.sha256
+          Compress-Archive -Path dist/SoftVault.exe, dist/SoftVault.exe.sha256 -DestinationPath dist/SoftVault-windows-x64.zip
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoftVault-windows-x64
+          path: |
+            dist/SoftVault.exe
+            dist/SoftVault.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (on tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SoftVault-windows-x64.zip
+            dist/SoftVault.exe.sha256
+          generate_release_notes: true

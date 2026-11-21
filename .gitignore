@@ -1,0 +1,4 @@
+target/
+*.db
+*.svx
+softvault-plaintext-*.json

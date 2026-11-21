@@ -1,0 +1,41 @@
+[package]
+name = "softvault"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-knowledge password & notes vault (Argon2id + XChaCha20-Poly1305, SQLite)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.5"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+chrono = "0.4.45"
+csv = "1.4.0"
+eframe = "0.37.0"
+egui = "0.37.0"
+egui_extras = { version = "0.37", features = ["syntect"] }
+hmac = "0.12"
+lettre = { version = "0.11.24", default-features = false, features = ["smtp-transport", "builder", "rustls-tls", "hostname"] }
+pulldown-cmark = { version = "0.13.6", default-features = false }
+qrcode = { version = "0.15.0", default-features = false }
+rand = "0.8"
+rfd = "0.18.0"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha1 = "0.10"
+zeroize = { version = "1.9.2", features = ["derive"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[build-dependencies]
+winresource = "0.1.34"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
